@@ -1,0 +1,29 @@
+name: gates
+on:
+  push:
+  pull_request:
+jobs:
+  goldens-llvmpipe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install software vulkan (llvmpipe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: vulkaninfo --summary || true
+      - run: cargo build --release
+      - name: gate_c1 (poseidon2 / merkle / ntt goldens)
+        env:
+          WGPU_BACKEND: vulkan
+        run: cargo run --release --bin gate_c1
+      - name: ntt_test
+        env:
+          WGPU_BACKEND: vulkan
+        run: cargo run --release --bin ntt_test
+      - name: fri_commit_test (golden 99fc8df2)
+        env:
+          WGPU_BACKEND: vulkan
+        run: cargo run --release --bin fri_commit_test
