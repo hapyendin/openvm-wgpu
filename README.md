@@ -1,5 +1,7 @@
 # openvm-wgpu — a WGSL proving-backend substrate for OpenVM STARKs
 
+> **Note:** this GitHub repository is a one-way mirror; the canonical history is maintained upstream. Issues and PRs are welcome here.
+
 **TL;DR:** the memory/commit/hash layer of an OpenVM 2.1.0-class STARK prover, reimplemented in Rust + [wgpu](https://github.com/gfx-rs/wgpu) (WGSL compute shaders), producing **byte-identical results on Intel Arc and NVIDIA GPUs through Vulkan — same artifact, zero vendor-specific kernels, no CUDA**.
 
 This is a work-in-progress backend substrate: the commit/NTT/Merkle/Poseidon2/transcript layer is closed and golden-tested; the fractional-GKR/zerocheck kernel surface is the remaining piece to a full GPU prove. See [Status](#status).
