@@ -285,9 +285,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&at.c, 0u);
   }
   workgroupBarrier();
+  // magic 0xDEADBEEFCAFE1234 built from u32 halves: a >2^63 u64 literal is
+  // rejected by naga (and not universal-WGSL); halves are legal everywhere.
+  let magic: u64 = (u64(0xDEADBEEFu) << 32u) | u64(0xCAFE1234u);
   // CAS first-wins (grind pattern): exactly one thread must consume
-  let r = atomicCompareExchangeWeak(&at.v, u64(0), u64(0xDEADBEEFCAFE1234) + u64(i));
-  if (r.consumed) {
+  let r = atomicCompareExchangeWeak(&at.v, u64(0), magic + u64(i));
+  if (r.exchanged) {
     atomicAdd(&at.c, 1u);
   }
   // u64 atomicAdd (sumcheck raw-sum pattern): 32 x 7

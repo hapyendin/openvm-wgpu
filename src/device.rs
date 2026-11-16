@@ -1,6 +1,9 @@
 // Device discovery + init (API shapes mirror wgpu 30.0.2 as used by the
-// golden-proven wgpu-probe). Vulkan-only backend. On b70 asserts Intel
-// vendor 0x8086 discrete (Arc); the farm-c1 run passes require_intel_arc=false.
+// golden-proven wgpu-probe). Vulkan-only backend. GATE W1: adapter selection
+// is capability-driven (see adapters.rs) instead of "first adapter":
+// SHADER_INT64 preferred, then max_buffer_size, then discrete. require_intel_arc
+// stays as strict-mode (OPENVM_WGPU_ARC=1 / --arc); WGPU_DEVICE=<substring>
+// pins by name. No adapter passes => FAIL CLOSED with the table printed.
 #[derive(Debug, Clone, Copy)]
 pub struct LimitsReport {
     pub max_storage_buffer_binding_size: u64,
@@ -36,10 +39,13 @@ pub struct WgpuDevice {
 }
 
 pub struct InitOpts {
-    /// require Intel (0x8086) discrete GPU — b70 law; false = any discrete
+    /// require Intel (0x8086) discrete GPU — b70 strict-mode law; false = capability pick
     pub require_intel_arc: bool,
     /// tolerate missing SHADER_INT64 (pure-u32 limb path)
     pub allow_u32_only: bool,
+    /// WGPU_DEVICE=<substring>: case-insensitive substring match on adapter
+    /// name pins the adapter; no match fails closed. None = capability pick.
+    pub device_substring: Option<String>,
 }
 
 fn feature_probe_list() -> Vec<(&'static str, wgpu::Features)> {
@@ -68,19 +74,33 @@ fn limits_of(l: &wgpu::Limits) -> LimitsReport {
 impl WgpuDevice {
     pub fn init(opts: InitOpts) -> WgpuDevice {
         let t0 = std::time::Instant::now();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: None,
-                ..Default::default()
+        // ---- GATE W1 selection path: enumerate + capability-driven pick ----
+        let enumerated = crate::adapters::enumerate_full();
+        let infos: Vec<crate::adapters::AdapterInfo> =
+            enumerated.iter().map(|e| e.info.clone()).collect();
+        let idx = match crate::adapters::select(
+            &infos,
+            opts.device_substring.as_deref(),
+            opts.require_intel_arc,
+            opts.allow_u32_only,
+        ) {
+            Ok(i) => i,
+            Err(reason) => {
+                crate::adapters::print_table(&infos);
+                panic!("FAIL CLOSED: {reason}");
+            }
+        };
+        let adapter = &enumerated[idx].adapter;
+        println!(
+            "SELECTED idx={idx}/{} strategy={} score={:?}",
+            infos.len(),
+            if opts.device_substring.is_some() {
+                "WGPU_DEVICE substring pin"
+            } else {
+                "capability (int64, buffer_max, discrete)"
             },
-        ))
-        .expect("no vulkan adapter");
+            crate::adapters::capability_score(&infos[idx])
+        );
         let info = adapter.get_info();
         let is_intel = info.vendor == 0x8086;
         assert!(
@@ -176,13 +196,39 @@ impl WgpuDevice {
 
     /// Runtime ground-truth probe: u64 atomicStore/CAS/ADD in one WGSL
     /// kernel. Ok(Some(...)) if the driver accepted AND ran u64 atomics;
-    /// Ok(None) if the wgpu feature flag is absent; Err if the feature was
-    /// advertised but compilation/execution failed (naga error surfaces via
-    /// device error handler — we also force a poll + error-scope check).
-    pub fn probe_u64_atomics(&self) -> Option<(u32, u32, u32)> {
+    /// Ok(None) if the wgpu feature flag is absent; Err if the probe module
+    /// failed to compile/execute (the wgpu 30 default error sink panics on
+    /// validation errors — e.g. naga@30 rejects u64 literals > i64::MAX in
+    /// the probe WGSL — so the whole probe runs under catch_unwind and the
+    /// failure surfaces as Err; the golden kernels are unaffected because
+    /// they never reference ATOMIC_PROBE).
+    pub fn probe_u64_atomics(&self) -> Result<Option<(u32, u32, u32)>, String> {
         if !self.has_shader_int64 || !self.has_int64_atomic_feature {
-            return None;
+            return Ok(None);
         }
+        // silence the panic hook during the probe; restore it afterwards.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.probe_u64_atomics_inner()
+        }));
+        std::panic::set_hook(prev_hook);
+        match result {
+            Ok(inner) => inner,
+            Err(e) => {
+                let msg = if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown panic".to_string()
+                };
+                Err(format!("probe panicked (naga/driver rejected probe WGSL?): {msg}"))
+            }
+        }
+    }
+
+    fn probe_u64_atomics_inner(&self) -> Result<Option<(u32, u32, u32)>, String> {
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -283,13 +329,15 @@ impl WgpuDevice {
                 submission_index: None,
                 timeout: None,
             })
-            .ok()?;
-        let data = slice.get_mapped_range().ok()?;
+            .map_err(|e| format!("probe poll failed: {e}"))?;
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| format!("probe map failed: {e}"))?;
         let lo = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let hi = u32::from_le_bytes(data[4..8].try_into().unwrap());
         let winners = u32::from_le_bytes(data[8..12].try_into().unwrap());
         drop(data);
         staging.unmap();
-        Some((winners, lo, hi))
+        Ok(Some((winners, lo, hi)))
     }
 }

@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod device;
 pub mod field;
 pub mod mat;

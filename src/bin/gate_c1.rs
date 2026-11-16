@@ -14,10 +14,15 @@ const VEC_SRC: &str = include_str!("../../goldens/vectors.inc");
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|a| a == "--list-adapters") {
+        wgpu_backend::adapters::list_adapters();
+        std::process::exit(0);
+    }
     let arc_mode = argv.iter().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
     let opts = InitOpts {
         require_intel_arc: arc_mode,
         allow_u32_only: !arc_mode,
+        device_substring: wgpu_backend::adapters::device_substring_from_env(),
     };
     println!("MODE: {}", if arc_mode { "arc (Intel Arc assert, int64 path)" } else { "any (discrete GPU, u32 fallback ok) — pass --arc to assert Intel Arc + int64" });
 
@@ -45,11 +50,11 @@ fn main() {
     );
     // ---- 2) u64 atomic probe (grind CAS / sumcheck add feasibility) ----
     match backend.dev.probe_u64_atomics() {
-        None => println!(
+        Ok(None) => println!(
             "U64_ATOMICS: UNAVAILABLE (feature SHADER_INT64_ATOMIC={}, SHADER_INT64={})",
             backend.dev.has_int64_atomic_feature, backend.dev.has_shader_int64
         ),
-        Some((winners, lo, hi)) => {
+        Ok(Some((winners, lo, hi))) => {
             let v = ((hi as u64) << 32) | lo as u64;
             let base = 0xDEADBEEFCAFE1234u64;
             let ok = winners == 1 && v >= base + 224 && v <= base + 224 + 31;
@@ -58,6 +63,9 @@ fn main() {
                 if ok { "WORKING" } else { "WRONG-RESULTS" }
             );
         }
+        Err(msg) => println!(
+            "U64_ATOMICS: PROBE-FAILED — probe module rejected by naga/driver ({msg}); golden path unaffected"
+        ),
     }
 
     let mut pass = true;

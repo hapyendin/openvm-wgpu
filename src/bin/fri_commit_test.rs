@@ -230,6 +230,11 @@ fn gpu_hash(gb: &WgpuBackend, width: usize, data: &[u32], n_rows: usize) -> Vec<
 
 /* ---- MAIN ---- */
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|a| a == "--list-adapters") {
+        wgpu_backend::adapters::list_adapters();
+        std::process::exit(0);
+    }
     println!("=== FRI COMMIT TEST v6 (C3 APPLY: b3 generators + pipeline fixes) ===\n");
     let p2 = Poseidon2::new();
 
@@ -254,6 +259,7 @@ fn main() {
     let opts = InitOpts {
         require_intel_arc: !farm_mode,
         allow_u32_only: farm_mode,
+        device_substring: wgpu_backend::adapters::device_substring_from_env(),
     };
     let gb = WgpuBackend::new(opts);
     println!("Adapter: {} (INT64={})\n", gb.dev.report.name, gb.dev.has_shader_int64);
