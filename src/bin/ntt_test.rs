@@ -109,7 +109,7 @@ fn main() {
     
     // GPU test
     let opts = InitOpts {
-        require_intel_arc: true,
+        require_intel_arc: std::env::var("OPENVM_WGPU_ARC").is_ok(),
         allow_u32_only: false,
     };
     

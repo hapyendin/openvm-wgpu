@@ -48,7 +48,7 @@ cargo run --release --bin gate_c1           # primitive goldens
 cargo run --release --bin fri_commit_test   # FRI commit vs golden 99fc8df2…
 ```
 
-Runs on any Vulkan-capable GPU (NVIDIA, AMD/RADV, Intel/ANV, llvmpipe in CI). Set `WGPU_BACKEND=vulkan`. The first adapter is used for now — device *selection* by capability and an install-time self-test are tracked in `C1-ARCH.md`.
+Runs on any Vulkan-capable GPU (NVIDIA, AMD/RADV, Intel/ANV, llvmpipe in CI). Set `WGPU_BACKEND=vulkan`. Pass `--arc` (or `OPENVM_WGPU_ARC=1`) to strict-mode: assert Intel Arc + int64 path. The first adapter is used for now — device *selection* by capability and an install-time self-test are tracked in `C1-ARCH.md`.
 
 ## Status
 

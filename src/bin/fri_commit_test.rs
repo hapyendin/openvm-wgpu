@@ -249,7 +249,8 @@ fn main() {
         })
         .collect();
 
-    let farm_mode = std::env::var("OPENVM_WGPU_FARM").is_ok();
+    // any discrete GPU by default; OPENVM_WGPU_ARC=1 asserts Intel Arc + int64 path
+    let farm_mode = std::env::var("OPENVM_WGPU_ARC").is_err();
     let opts = InitOpts {
         require_intel_arc: !farm_mode,
         allow_u32_only: farm_mode,
