@@ -285,10 +285,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicStore(&at.c, 0u);
   }
   workgroupBarrier();
+  // CAS first-wins (grind pattern): exactly one thread must consume
   // magic 0xDEADBEEFCAFE1234 built from u32 halves: a >2^63 u64 literal is
   // rejected by naga (and not universal-WGSL); halves are legal everywhere.
   let magic: u64 = (u64(0xDEADBEEFu) << 32u) | u64(0xCAFE1234u);
-  // CAS first-wins (grind pattern): exactly one thread must consume
   let r = atomicCompareExchangeWeak(&at.v, u64(0), magic + u64(i));
   if (r.exchanged) {
     atomicAdd(&at.c, 1u);
@@ -308,17 +308,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ---- NTT 4096-pt (single workgroup, 512 threads) ----
 // DIT-NTT with bit-reversed input, natural output. Twiddles are Montgomery words.
 // Forward NTT uses omega (generator); inverse uses omega_inv scaled by 1/n.
-pub const NTT_WGSL: &str = r#"
-// Mul function - same as in COMMON, but included here for standalone compilation
-fn mul(a: u32, b: u32) -> u32 {
-  let t = u64(a) * u64(b);
-  let m = u32(t) * 2013265919u;
-  let u = u64(m) * u64(2013265921u);
-  var r: u32 = u32((t + u) >> 32u);
-  if (r >= 2013265921u) { r = r - 2013265921u; }
-  return r;
-}
-
+// NB: `mul` is supplied by the MUL_U64/MUL_U32 prelude (see ntt_source()).
+pub const NTT_BODY: &str = r#"
 @group(0) @binding(0) var<storage, read> nin: array<u32>;
 @group(0) @binding(1) var<storage, read> tw: array<u32>;
 @group(0) @binding(2) var<storage, read_write> st: array<u32>;
@@ -408,3 +399,23 @@ fn ntt_4096_inv(@builtin(local_invocation_id) lid: vec3<u32>) {
   }
 }
 "#;
+
+/// The field-mul prelude for a kernel body that calls `mul(a,b)->u32` but
+/// does not define it. Both preludes expose the SAME `fn mul` symbol.
+pub fn mul_prelude(u64_mul: bool) -> &'static str {
+    if u64_mul {
+        MUL_U64
+    } else {
+        MUL_U32
+    }
+}
+
+/// Compose prelude + self-contained kernel body (bodies must NOT define
+/// `mul`/`mul64`/`W64` themselves).
+pub fn with_prelude(u64_mul: bool, body: &str) -> String {
+    format!("{}\n{}", mul_prelude(u64_mul), body)
+}
+
+pub fn ntt_source(u64_mul: bool) -> String {
+    with_prelude(u64_mul, NTT_BODY)
+}

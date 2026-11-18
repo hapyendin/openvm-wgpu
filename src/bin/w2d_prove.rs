@@ -334,7 +334,7 @@ fn main() {
     // ---------------- GPU grinds ----------------
     let wgrind = dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("grind"),
-        source: wgpu::ShaderSource::Wgsl(format!("{}{}\n{}", wgsl::MUL_U64, wgsl::COMMON, GRIND_WGSL).into()),
+        source: wgpu::ShaderSource::Wgsl(format!("{}{}\n{}", wgsl::mul_prelude(dev.has_shader_int64), wgsl::COMMON, GRIND_WGSL).into()),
     });
     let bgl = dev.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("grind-bgl"),

@@ -5,14 +5,7 @@ use crate::device::WgpuDevice;
 use crate::field::{constants_buffer_mont, u32s_to_bytes};
 
 const WGSL: &str = r#"
-fn mul(a: u32, b: u32) -> u32 {
-  let t = u64(a) * u64(b);
-  let m = u32(t) * 2013265919u;
-  let u = u64(m) * u64(2013265921u);
-  var r: u32 = u32((t + u) >> 32u);
-  if (r >= 2013265921u) { r = r - 2013265921u; }
-  return r;
-}
+// `mul` supplied by wgsl::mul_prelude (u64-REDC or pure-u32 limb path)
 
 @group(0) @binding(0) var<storage, read> kc: array<u32>;
 @group(0) @binding(1) var<storage, read_write> io1: array<u32>;
@@ -203,7 +196,9 @@ impl WhirFold {
     pub fn new(dev: &WgpuDevice) -> WhirFold {
         let module = dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("whir_fold"),
-            source: wgpu::ShaderSource::Wgsl(WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::wgsl::with_prelude(dev.has_shader_int64, WGSL).into(),
+            ),
         });
         let bgl = dev.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,

@@ -123,7 +123,9 @@ impl GkrPipeline {
     pub fn new(dev: &WgpuDevice) -> GkrPipeline {
         let module = dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gkr-w2a"),
-            source: wgpu::ShaderSource::Wgsl(GKR_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::wgsl::with_prelude(dev.has_shader_int64, GKR_WGSL).into(),
+            ),
         });
         let bgl = dev.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("gkr-4slot"),

@@ -129,10 +129,20 @@ impl WgpuDevice {
             .map(|(n, _)| n.to_string())
             .collect();
         println!("FEATURES_AVAILABLE: {}", avail.join(","));
-        let has_i64 = adapter.features().contains(wgpu::Features::SHADER_INT64);
-        let has_atomic = adapter
+        // OPENVM_WGPU_FORCE_U32=1: spec-portable path — SHADER_INT64* features
+        // are NOT requested even when the adapter advertises them, so any
+        // int64 in a compiled shader is a hard device-error (self-auditing).
+        let force_u32 = std::env::var("OPENVM_WGPU_FORCE_U32")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let has_i64 = !force_u32 && adapter.features().contains(wgpu::Features::SHADER_INT64);
+        let has_atomic = !force_u32
+            && adapter
             .features()
             .contains(wgpu::Features::SHADER_INT64_ATOMIC_ALL_OPS);
+        if force_u32 {
+            println!("OPENVM_WGPU_FORCE_U32=1: SHADER_INT64 features excluded (u32-limb path)");
+        }
         let has_atomic_minmax = adapter
             .features()
             .contains(wgpu::Features::SHADER_INT64_ATOMIC_MIN_MAX);

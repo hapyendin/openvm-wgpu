@@ -164,10 +164,10 @@ pub struct NttPipelineSet {
 }
 
 impl NttPipelineSet {
-    pub fn new(dev: &WgpuDevice, _u64_mul: bool) -> NttPipelineSet {
+    pub fn new(dev: &WgpuDevice, u64_mul: bool) -> NttPipelineSet {
         let module = dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ntt"),
-            source: wgpu::ShaderSource::Wgsl(crate::wgsl::NTT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::wgsl::ntt_source(u64_mul).into()),
         });
         let bgl = dev
             .device

@@ -110,7 +110,7 @@ fn main() {
     let dev = WgpuDevice::init(InitOpts { require_intel_arc: arc_mode, allow_u32_only: !arc_mode, device_substring: wgpu_backend::adapters::device_substring_from_env() });
     println!("ADAPTER {}", dev.report.name);
     let wf = WhirFold::new(&dev);
-    let src = format!("{}{}\n{}", wgsl::MUL_U64, wgsl::COMMON, GRIND_WGSL);
+    let src = format!("{}{}\n{}", wgsl::mul_prelude(dev.has_shader_int64), wgsl::COMMON, GRIND_WGSL);
     let module = dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("grind"),
         source: wgpu::ShaderSource::Wgsl(src.into()),

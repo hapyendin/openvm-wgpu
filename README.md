@@ -2,7 +2,7 @@
 
 > **Note:** this GitHub repository is a one-way mirror; the canonical history is maintained upstream. Issues and PRs are welcome here.
 
-**TL;DR:** a full OpenVM 2.1.0-class STARK **prove path** — commitments, transcript, fractional-GKR, logup zerocheck, WHIR folding, PoW grind, proof assembly — reimplemented in Rust + [wgpu](https://github.com/gfx-rs/wgpu) (WGSL compute shaders), producing **byte-identical proofs on Intel Arc and NVIDIA GPUs through Vulkan — same artifact, zero vendor-specific kernels, no CUDA**.
+**TL;DR:** a full OpenVM 2.1.0-class STARK **prove path** — commitments, transcript, fractional-GKR, logup zerocheck, WHIR folding, PoW grind, proof assembly — reimplemented in Rust + [wgpu](https://github.com/gfx-rs/wgpu) (WGSL compute shaders), producing **byte-identical proofs on Intel Arc and NVIDIA GPUs through Vulkan — same artifact, zero vendor-specific kernels, no CUDA** — with a spec-portable pure-u32 math mode that removes even the int64 shader requirement, opening the browser/WebGPU tier.
 
 As of 2026-11-18 the full single-process GPU prove is closed: every stage is golden-tested and run-deterministic, and the complete proof path replicates byte-for-byte across silicon vendors. See [Status](#status) and the [portability matrix](#portability-matrix-arc-b70--tree-of-record-runs-nvidia-a16--farm-recheck-plain-vulkan).
 
@@ -31,6 +31,7 @@ src/
   constants_gen.rs  two-adic generators, Poseidon2 params (from upstream constants)
   ntt_wgsl.rs       radix-2/4 NTT (matches vendored sppark ntt.cu semantics)
   wgsl.rs           WGSL sources: poseidon2, merkle, ntt, fri_commit kernels
+                    (field math injected via interchangeable u64-REDC / pure-u32 preludes)
   gkr.rs / gkr_wgsl.rs     fractional-GKR sumcheck host + WGSL eval/fold kernels
   logup_leaf.rs            logup-zerocheck leaf build + fold (2^26-row tables on-GPU)
   w2c.rs / whir_fold.rs    WHIR fold (mobius + DIT-FFT over EF4 + keccak merkle) + grind
@@ -42,6 +43,7 @@ src/bin/
   gate_c1.rs        primitive goldens (poseidon2 batch, merkle root, NTT)
   ntt_test.rs       NTT roundtrip goldens
   fri_commit_test.rs FRI commit vs golden layer roots
+  u32mul_test.rs     host+GPU proof of the pure-u32 REDC (full-domain, 16.7M pairs)
   w2a_gkr.rs         GKR sumcheck gate (multi-instance, determinism xN)
   w2b_logup.rs       logup zerocheck gate (leaf->fold->roots)
   w2c_fold.rs / w2c_grind.rs  WHIR fold matrix + PoW grind (90-site golden)
@@ -57,7 +59,7 @@ cargo run --release --bin gate_c1           # primitive goldens
 cargo run --release --bin fri_commit_test   # FRI commit vs golden 99fc8df2…
 ```
 
-Runs on any Vulkan-capable GPU exposing `SHADER_INT64` (NVIDIA, AMD/RADV, Intel/ANV). Set `WGPU_BACKEND=vulkan`. Adapter choice is capability-driven: `--list-adapters` prints the full capability table, `WGPU_DEVICE=<substring>` pins by name, `--arc` (or `OPENVM_WGPU_ARC=1`) strict-modes to Intel Arc + int64; no qualifying adapter fails closed. The u32-limb path (no int64 requirement, browser-tier) is implemented in the field layer but not yet wired end-to-end.
+Runs on any Vulkan-capable GPU exposing `SHADER_INT64` (NVIDIA, AMD/RADV, Intel/ANV), **or on any GPU at all with `OPENVM_WGPU_FORCE_U32=1`** — the spec-portable pure-u32 field path (no int64 shader features required, WebGPU/browser-tier math). Set `WGPU_BACKEND=vulkan`. Adapter choice is capability-driven: `--list-adapters` prints the full capability table, `WGPU_DEVICE=<substring>` pins by name, `--arc` (or `OPENVM_WGPU_ARC=1`) strict-modes to Intel Arc + int64; no qualifying adapter fails closed. The u32-limb path (no int64 requirement, browser-tier) is implemented in the field layer but not yet wired end-to-end.
 
 ## Status
 
@@ -68,8 +70,9 @@ Runs on any Vulkan-capable GPU exposing `SHADER_INT64` (NVIDIA, AMD/RADV, Intel/
 - ✅ end-to-end single-process GPU prove (`w2d_prove`): transcript→leaf→GKR→fold→grind→proof stream, ~5 GB VRAM / <500 MB host, matching an upstream reference `pv`
 - ✅ cross-vendor proof: zero WGSL edits between Arc and NVIDIA; 5/5 matrix rows byte-identical incl. the full prove (see [portability matrix](#portability-matrix-arc-b70--tree-of-record-runs-nvidia-a16--farm-recheck-plain-vulkan))
 - ✅ capability-driven adapter selection (W1): enumerate, score, pin, fail closed
-- 🔜 u32-limb path wired end-to-end (browser/WebGPU tier)
-- 🔜 third-silicon validation: AMD/RADV, Apple/Metal — gate suite ready, hardware calls welcome
+- ✅ spec-portable u32-limb field path wired end-to-end: with `OPENVM_WGPU_FORCE_U32=1` (zero int64 features requested), the **entire gate ladder up to the full proof reproduces byte-identical** — 16.7M-pair host proof of the emulated REDC, u32 kernels within ~5% of u64 on Arc (memory-bound)
+- 🔜 browser/WebGPU tier: 128 MiB storage-binding sharding + wasm harness (math done, plumbing next)
+- 🔜 third-silicon validation: AMD/RADV, Apple/Metal — gate suite ready (both mul paths), hardware calls welcome
 
 ## Portability matrix (Arc B70 = tree-of-record runs; NVIDIA A16 = farm recheck, plain Vulkan)
 

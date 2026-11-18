@@ -7,10 +7,9 @@ pub mod logup_leaf;
 pub mod mat;
 pub mod pipeline;
 pub mod traits;
-pub mod w2c;
 pub mod wgsl;
+pub mod w2c;
 pub mod whir_fold;
-
 
 pub use device::{InitOpts, WgpuDevice};
 pub use mat::WgpuMat;

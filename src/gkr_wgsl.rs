@@ -38,15 +38,7 @@
 pub const GKR_WGSL: &str = r#"
 const PP: u32 = 2013265921u;
 
-// u64-REDC Montgomery multiply (same body as the golden-proven C1/C2 kernels)
-fn mul(a: u32, b: u32) -> u32 {
-  let t = u64(a) * u64(b);
-  let m = u32(t) * 2013265919u;
-  let u = u64(m) * u64(2013265921u);
-  var r: u32 = u32((t + u) >> 32u);
-  if (r >= 2013265921u) { r = r - 2013265921u; }
-  return r;
-}
+// `mul` supplied by wgsl::mul_prelude (u64-REDC or pure-u32 limb path)
 
 fn addm(a: u32, b: u32) -> u32 {
   var s = a + b;

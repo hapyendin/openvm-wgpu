@@ -27,14 +27,7 @@ use crate::field::{decode, encode};
 pub const LOGUP_WGSL: &str = r#"
 const PP: u32 = 2013265921u;
 
-fn mul(a: u32, b: u32) -> u32 {
-  let t = u64(a) * u64(b);
-  let m = u32(t) * 2013265919u;
-  let u = u64(m) * u64(2013265921u);
-  var r: u32 = u32((t + u) >> 32u);
-  if (r >= 2013265921u) { r = r - 2013265921u; }
-  return r;
-}
+// `mul` supplied by wgsl::mul_prelude (u64-REDC or pure-u32 limb path)
 fn addm(a: u32, b: u32) -> u32 {
   var s = a + b;
   if (s >= PP) { s = s - PP; }
@@ -227,7 +220,9 @@ impl LeafPipeline {
     pub fn new(dev: &WgpuDevice) -> LeafPipeline {
         let module = dev.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("logup-w2b"),
-            source: wgpu::ShaderSource::Wgsl(LOGUP_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::wgsl::with_prelude(dev.has_shader_int64, LOGUP_WGSL).into(),
+            ),
         });
         let bgl = dev.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("logup-4slot"),
