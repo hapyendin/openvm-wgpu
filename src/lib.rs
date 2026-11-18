@@ -1,10 +1,16 @@
 pub mod adapters;
 pub mod device;
 pub mod field;
+pub mod gkr;
+pub mod gkr_wgsl;
+pub mod logup_leaf;
 pub mod mat;
 pub mod pipeline;
 pub mod traits;
+pub mod w2c;
 pub mod wgsl;
+pub mod whir_fold;
+
 
 pub use device::{InitOpts, WgpuDevice};
 pub use mat::WgpuMat;

@@ -44,7 +44,7 @@ fn mul(a: u32, b: u32) -> u32 {
 }
 "#;
 
-const COMMON: &str = r#"
+pub const COMMON: &str = r#"
 @group(0) @binding(0) var<storage, read> kc: array<u32>;
 @group(0) @binding(1) var<storage, read_write> io1: array<u32>;
 @group(0) @binding(2) var<storage, read_write> io2: array<u32>;

@@ -2,9 +2,9 @@
 
 > **Note:** this GitHub repository is a one-way mirror; the canonical history is maintained upstream. Issues and PRs are welcome here.
 
-**TL;DR:** the memory/commit/hash layer of an OpenVM 2.1.0-class STARK prover, reimplemented in Rust + [wgpu](https://github.com/gfx-rs/wgpu) (WGSL compute shaders), producing **byte-identical results on Intel Arc and NVIDIA GPUs through Vulkan — same artifact, zero vendor-specific kernels, no CUDA**.
+**TL;DR:** a full OpenVM 2.1.0-class STARK **prove path** — commitments, transcript, fractional-GKR, logup zerocheck, WHIR folding, PoW grind, proof assembly — reimplemented in Rust + [wgpu](https://github.com/gfx-rs/wgpu) (WGSL compute shaders), producing **byte-identical proofs on Intel Arc and NVIDIA GPUs through Vulkan — same artifact, zero vendor-specific kernels, no CUDA**.
 
-This is a work-in-progress backend substrate: the commit/NTT/Merkle/Poseidon2/transcript layer is closed and golden-tested; the fractional-GKR/zerocheck kernel surface is the remaining piece to a full GPU prove. See [Status](#status).
+As of 2026-11-18 the full single-process GPU prove is closed: every stage is golden-tested and run-deterministic, and the complete proof path replicates byte-for-byte across silicon vendors. See [Status](#status) and the [portability matrix](#portability-matrix-arc-b70--tree-of-record-runs-nvidia-a16--farm-recheck-plain-vulkan).
 
 ## Why
 
@@ -31,6 +31,9 @@ src/
   constants_gen.rs  two-adic generators, Poseidon2 params (from upstream constants)
   ntt_wgsl.rs       radix-2/4 NTT (matches vendored sppark ntt.cu semantics)
   wgsl.rs           WGSL sources: poseidon2, merkle, ntt, fri_commit kernels
+  gkr.rs / gkr_wgsl.rs     fractional-GKR sumcheck host + WGSL eval/fold kernels
+  logup_leaf.rs            logup-zerocheck leaf build + fold (2^26-row tables on-GPU)
+  w2c.rs / whir_fold.rs    WHIR fold (mobius + DIT-FFT over EF4 + keccak merkle) + grind
   pipeline.rs       pipeline cache, 2 GB-binding-safe dispatch
   device.rs         wgpu device/queue bootstrap
   mat.rs            DeviceMatrix (hal::Matrix impl)
@@ -38,7 +41,11 @@ src/
 src/bin/
   gate_c1.rs        primitive goldens (poseidon2 batch, merkle root, NTT)
   ntt_test.rs       NTT roundtrip goldens
-  fri_commit_test.rs FRI commit vs golden layer roots (the big one)
+  fri_commit_test.rs FRI commit vs golden layer roots
+  w2a_gkr.rs         GKR sumcheck gate (multi-instance, determinism xN)
+  w2b_logup.rs       logup zerocheck gate (leaf->fold->roots)
+  w2c_fold.rs / w2c_grind.rs  WHIR fold matrix + PoW grind (90-site golden)
+  w2d_prove.rs       end-to-end single-process GPU prove -> proof stream + report
 goldens/vectors.inc generated test vectors (pure math; no app data)
 ```
 
@@ -50,16 +57,54 @@ cargo run --release --bin gate_c1           # primitive goldens
 cargo run --release --bin fri_commit_test   # FRI commit vs golden 99fc8df2…
 ```
 
-Runs on any Vulkan-capable GPU (NVIDIA, AMD/RADV, Intel/ANV, llvmpipe in CI). Set `WGPU_BACKEND=vulkan`. Pass `--arc` (or `OPENVM_WGPU_ARC=1`) to strict-mode: assert Intel Arc + int64 path. The first adapter is used for now — device *selection* by capability and an install-time self-test are tracked in `C1-ARCH.md`.
+Runs on any Vulkan-capable GPU exposing `SHADER_INT64` (NVIDIA, AMD/RADV, Intel/ANV). Set `WGPU_BACKEND=vulkan`. Adapter choice is capability-driven: `--list-adapters` prints the full capability table, `WGPU_DEVICE=<substring>` pins by name, `--arc` (or `OPENVM_WGPU_ARC=1`) strict-modes to Intel Arc + int64; no qualifying adapter fails closed. The u32-limb path (no int64 requirement, browser-tier) is implemented in the field layer but not yet wired end-to-end.
 
 ## Status
 
 - ✅ device layer, Poseidon2 (12,287-perm batches bit-exact), Merkle, NTT (4096/2²⁰ roundtrip), DuplexSponge transcript
 - ✅ FRI/LDE commit pipeline: all golden layer roots + concat sha, GPU==CPU bit-exact parity
-- ✅ cross-vendor proof: zero WGSL edits between Arc and NVIDIA
-- 🔜 fractional-GKR / zerocheck kernels (the openvm stacked-commit exec path)
-- 🔜 adapter auto-selection + capability-gated kernel variants (u64 REDC ⇄ u32 limb-split)
-- 🔜 end-to-end prove matching an upstream reference `pv`
+- ✅ fractional-GKR sumcheck + logup zerocheck kernels (WGSL), byte-exact vs CPU goldens, 5x run-deterministic
+- ✅ WHIR fold + PoW grind (sequential-scan first-winner: determinism over atomics)
+- ✅ end-to-end single-process GPU prove (`w2d_prove`): transcript→leaf→GKR→fold→grind→proof stream, ~5 GB VRAM / <500 MB host, matching an upstream reference `pv`
+- ✅ cross-vendor proof: zero WGSL edits between Arc and NVIDIA; 5/5 matrix rows byte-identical incl. the full prove (see [portability matrix](#portability-matrix-arc-b70--tree-of-record-runs-nvidia-a16--farm-recheck-plain-vulkan))
+- ✅ capability-driven adapter selection (W1): enumerate, score, pin, fail closed
+- 🔜 u32-limb path wired end-to-end (browser/WebGPU tier)
+- 🔜 third-silicon validation: AMD/RADV, Apple/Metal — gate suite ready, hardware calls welcome
+
+## Portability matrix (Arc B70 = tree-of-record runs; NVIDIA A16 = farm recheck, plain Vulkan)
+
+### C-generation gates (PORTABILITY v2, 2026-11-16, farm-c1 A16 driver 550.163.01)
+| Gate | Arc BMG G31 | NVIDIA A16 |
+|---|---|---|
+| gate_c1 (poseidon2+merkle) | PASS 1264a0fd266c3e7b... | PASS byte-identical |
+| ntt_test | PASS a11b282970362f31... | PASS byte-identical |
+| fri_commit_test | PASS 99fc8df2 / 5f51333d... | PASS byte-identical |
+
+### GATE W2 rows (2026-11-18; Arc = closed-green parent-verified; A16 = recheck this round)
+A16 box: port-lab (farm-c1 was destroyed 2026-11-16), NVIDIA A16 vGPU,
+adapter name=\"NVIDIA A16\" vendor=0x10de device=0x25b6 driver=\"NVIDIA\"
+driver_info=\"620.70.06\" type=DiscreteGpu, Vulkan, wgpu 30.0.2, rustc 1.91.1.
+Arc adapter: name=\"Intel(R) Graphics (BMG G31)\" vendor=0x8086 device=0xe223
+Mesa 26.1.6. Host-side farm gate only (OPENVM_WGPU_FARM=1 adapter assert
+bypass in device.rs); WGSL bytes identical (src/ sha256-tree 74fc5898c465a871...
+identical on both boxes).
+
+| Gate | Check | Arc BMG G31 (Vulkan/ANV) | NVIDIA A16 (Vulkan) |
+|---|---|---|---|
+| w2c_grind | 90 PoW sites GPU==CPU==recorded; 90/90 min==recorded | PASS run-hash e69fddee611e56ab609a2928c6ab1827a743c6d9235b3cc5a0e48eff43f715a5 x5 | PASS 2x run-hash byte-identical e69fddee...; u64 atomics = SHADER_INT64_ATOMIC_ALL_OPS |
+| w2a_gkr agg-leaf | levels==cpu goldens; 0 value/snap mismatches; 5 runs det | PASS run-hash fd53a33e82d7319b551a97c0710e5e75fac26980c0b6c1b02bd79bef0929f691 x5 | PASS 5x run-hash byte-identical fd53a33e...; leaf_sha 5c65a7bbc355594d... + lvl13/14/16/18/20 snap shas == AT5 |
+| w2c_fold agg-leaf | WHIR fold (mobius+DIT-FFT+keccak merkle) vs w2c-r1 dumps | PASS golden_ok x5; grs_sha r0 5b91a9e38bfa47fb..., r1 28948222729453e2... | PASS golden_ok x5; 15/15 report rows byte-identical vs Arc 5x5 report (ex-timing) |
+| w2b_logup | 2^26 logup leaf GPU build + 25 GKR rounds, cpu9 world | PASS leaf f5ecc63de1646b06..., out_sha 8c06f8ac2b4070d6... x5 | PASS 5x leaf/out_sha byte-identical; results JSON == Arc byte-for-byte ex run times (A16 18s vs Arc 6.5s/run) |
+| w2d_prove | full proof path, app-segments | PASS (b70, proof sha == recorded, pv 5ed5d617...) | PASS — world 7,310,589,717 B shipped b70->port-lab 2026-11-18; emitted proof sha 3e3bfbec62b817f5f9813a326af4698816bd9f95fd4a7d83a9ea9e6f4b7a3d0d == recorded == Arc (byte-identical, 15492 words); chain 2237/2237, leaf 01b3cb7e5db3a2de..., grinds 22/22, fold 4/4, gkr valmism=0, stream_equal=true, green=true; vm_hwm=739MB, wall 28s |
+
+**Divergences found: NONE.** All shipped-byte gates are byte-identical Arc vs A16.
+Driver delta across rounds (550.163.01 -> 620.70.06) did not move any golden.
+
+## Provenance
+- b70:~/appz/openvm-wgpu = tree of record; Arc results W2{A,B,C,D}-REPORT.md.
+- A16 recheck artifacts: port-lab:/root/w2-recheck/ (PROGRESS.txt, *-a16.json, run logs)
+  + port-lab:/root/wgpu-backend-v2 (rsync of this tree minus target/, device.rs farm-gate patch landed back to this tree).
+- Summary doc: M1 ~/workspace/farm-c1-PORTABILITY-v3.md (copy in /root/w2-recheck/).
 
 ## Testing your GPU (we want your matrix)
 
