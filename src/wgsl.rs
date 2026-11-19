@@ -292,7 +292,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // rejected by naga; the halves compose exactly.
   let magic: u64 = (u64(0xDEADBEEFu) << 32u) | u64(0xCAFE1234u);
   let r = atomicCompareExchangeWeak(&at.v, u64(0), magic + u64(i));
-  if (r.consumed) {
+  if (r.old_value == u64(0)) {
     atomicAdd(&at.c, 1u);
   }
   // u64 atomicAdd (sumcheck raw-sum pattern): 32 x 7
