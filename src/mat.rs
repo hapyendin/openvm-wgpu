@@ -9,7 +9,7 @@ use crate::field::u32s_to_bytes;
 
 /// Hard ceiling per binding; keep 250 MiB headroom below the adapter cap for
 /// future binding-header growth and alignment.
-pub const CHUNK_HEADROOM_BYTES: u64 = 250 * 1024 * 1024;
+pub const CHUNK_HEADROOM_BYTES: u64 = 250 * 1024 * 1024; // legacy; see chunk_words headroom logic
 
 pub struct WgpuMat {
     pub height: usize,
@@ -20,17 +20,19 @@ pub struct WgpuMat {
 }
 
 impl WgpuMat {
-    fn chunk_words(dev: &WgpuDevice, len_words: usize) -> usize {
-        let cap = dev
-            .report
-            .limits
-            .max_storage_buffer_binding_size
-            .saturating_sub(CHUNK_HEADROOM_BYTES)
-            / 4;
-        (cap as usize).min(len_words.max(1)).max(1024)
+    /// Row-aligned pow2 chunk size (in words). Under WebGPU-floor device
+    /// limits the binding cap is 128 MiB, so chunks are sized to fit one
+    /// binding with headroom, rounded DOWN to whole pow2 rows.
+    fn chunk_words(dev: &WgpuDevice, len_words: usize, width: usize) -> usize {
+        let cap = dev.report.limits.max_storage_buffer_binding_size;
+        let head = (250 * 1024 * 1024).min(cap / 16);
+        let usable = (cap - head) / 4; // words
+        let w = width.max(1);
+        let rows = ((len_words / w).min((usable.max(w as u64) / w as u64) as usize)).max(1);
+        crate::device::pow2_floor(rows as u64) as usize * w
     }
 
-    fn chunk_len(&self, i: usize) -> usize {
+    pub fn chunk_len(&self, i: usize) -> usize {
         (self.len_words - i * self.words_per_chunk).min(self.words_per_chunk)
     }
 
@@ -54,7 +56,7 @@ impl WgpuMat {
     /// zeros(h, w): like CUDA-side zeros matrices; no host round-trip.
     pub fn zeros(dev: &WgpuDevice, height: usize, width: usize) -> WgpuMat {
         let len_words = height * width;
-        let wpc = Self::chunk_words(dev, len_words);
+        let wpc = Self::chunk_words(dev, len_words, width);
         WgpuMat {
             height,
             width,

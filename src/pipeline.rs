@@ -113,9 +113,35 @@ impl KernelCtx {
     }
 
     pub fn set_seed(&self, dev: &WgpuDevice, seed_canon: u32) {
+        self.set_seed_row(dev, seed_canon, 0);
+    }
+
+    /// seed + row base (uni.a1) for windowed binds of >binding buffers.
+    pub fn set_seed_row(&self, dev: &WgpuDevice, seed_canon: u32, rowbase: u32) {
         let mut b = [0u8; 16];
         b[0..4].copy_from_slice(&seed_canon.to_le_bytes());
+        b[4..8].copy_from_slice(&rowbase.to_le_bytes());
         dev.queue.write_buffer(&self.uni_buf, 0, &b);
+    }
+
+    /// bind with sliced BindingResources (windowed sharded buffers).
+    pub fn bind_res<'a>(
+        &self,
+        dev: &WgpuDevice,
+        ps: &PipelineSet,
+        io1: wgpu::BindingResource<'a>,
+        io2: wgpu::BindingResource<'a>,
+    ) -> wgpu::BindGroup {
+        dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &ps.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.kc_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: io1 },
+                wgpu::BindGroupEntry { binding: 2, resource: io2 },
+                wgpu::BindGroupEntry { binding: 3, resource: self.uni_buf.as_entire_binding() },
+            ],
+        })
     }
 
     pub fn bind(&self, dev: &WgpuDevice, ps: &PipelineSet, io1: &wgpu::Buffer, io2: &wgpu::Buffer) -> wgpu::BindGroup {

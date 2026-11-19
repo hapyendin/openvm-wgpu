@@ -40,10 +40,10 @@ fn br12(xin: u32) -> u32 {
 
 var<workgroup> data: array<u32, 4096u>;
 
-@compute @workgroup_size(512u)
+@compute @workgroup_size(256u)
 fn ntt_4096_fwd(@builtin(local_invocation_id) lid: vec3<u32>) {
   let tid = lid.x;
-  for (var k: u32 = tid; k < 4096u; k = k + 512u) {
+  for (var k: u32 = tid; k < 4096u; k = k + 256u) {
     data[br12(k)] = nin[k];
   }
   workgroupBarrier();
@@ -51,7 +51,7 @@ fn ntt_4096_fwd(@builtin(local_invocation_id) lid: vec3<u32>) {
   for (var s: u32 = 1u; s <= 12u; s = s + 1u) {
     let half = 1u << s;
     let q1 = half >> 1u;
-    for (var i: u32 = tid; i < 2048u; i = i + 512u) {
+    for (var i: u32 = tid; i < 2048u; i = i + 256u) {
       let b = i & (q1 - 1u);
       let blk = i >> (s - 1u);
       let pp = blk * half + b;
@@ -65,15 +65,15 @@ fn ntt_4096_fwd(@builtin(local_invocation_id) lid: vec3<u32>) {
     off = off + (1u << (s - 1u));
     workgroupBarrier();
   }
-  for (var k2: u32 = tid; k2 < 4096u; k2 = k2 + 512u) {
+  for (var k2: u32 = tid; k2 < 4096u; k2 = k2 + 256u) {
     st[k2] = data[k2];
   }
 }
 
-@compute @workgroup_size(512u)
+@compute @workgroup_size(256u)
 fn ntt_4096_inv(@builtin(local_invocation_id) lid: vec3<u32>) {
   let tid = lid.x;
-  for (var k: u32 = tid; k < 4096u; k = k + 512u) {
+  for (var k: u32 = tid; k < 4096u; k = k + 256u) {
     data[br12(k)] = nin[k];
   }
   workgroupBarrier();
@@ -81,7 +81,7 @@ fn ntt_4096_inv(@builtin(local_invocation_id) lid: vec3<u32>) {
   for (var s: u32 = 1u; s <= 12u; s = s + 1u) {
     let half = 1u << s;
     let q1 = half >> 1u;
-    for (var i: u32 = tid; i < 2048u; i = i + 512u) {
+    for (var i: u32 = tid; i < 2048u; i = i + 256u) {
       let b = i & (q1 - 1u);
       let blk = i >> (s - 1u);
       let pp = blk * half + b;
@@ -96,7 +96,7 @@ fn ntt_4096_inv(@builtin(local_invocation_id) lid: vec3<u32>) {
     workgroupBarrier();
   }
   let inv4096 = 1509949441u;
-  for (var k2: u32 = tid; k2 < 4096u; k2 = k2 + 512u) {
+  for (var k2: u32 = tid; k2 < 4096u; k2 = k2 + 256u) {
     st[k2] = mul(data[k2], inv4096);
   }
 }

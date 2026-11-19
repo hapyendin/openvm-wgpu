@@ -49,10 +49,6 @@ struct Site {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--list-adapters") {
-        wgpu_backend::adapters::list_adapters();
-        std::process::exit(0);
-    }
     let mut bases = PathBuf::from("w2c-grind-bases.bin");
     let mut sites_f = PathBuf::from("/home/matt/appz/openvm-wgpu/w2c/pow_sites_r1.jsonl");
     let mut gold = PathBuf::from("/home/matt/appz/openvm-wgpu/w2c-results-r1-GREEN.json");
@@ -106,7 +102,11 @@ fn main() {
         assert_eq!(t["bits"].as_u64().unwrap() as u32, s.bits, "bits");
     }
 
-    let arc_mode = args.iter().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
+    let arc_mode = std::env::args().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
+    if std::env::args().any(|a| a == "--list-adapters") {
+        wgpu_backend::adapters::list_adapters();
+        std::process::exit(0);
+    }
     let dev = WgpuDevice::init(InitOpts { require_intel_arc: arc_mode, allow_u32_only: !arc_mode, device_substring: wgpu_backend::adapters::device_substring_from_env() });
     println!("ADAPTER {}", dev.report.name);
     let wf = WhirFold::new(&dev);

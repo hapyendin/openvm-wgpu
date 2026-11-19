@@ -10,7 +10,10 @@
 // Some, compilation_options, PollType::Wait, submit(Some), mapped_at_creation).
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::Path;
+
+use crate::limitsbuf::ShardBuf;
 
 use wgpu::BufferUsages as BU;
 
@@ -209,60 +212,22 @@ impl GkrPipeline {
         dev.queue.write_buffer(&self.uni, 0, &b);
     }
 
-    // src (binding 0) always binds whole buffer; src2 (binding 1) at eq_off;
-    // dst (binding 2) binds whole buffer with write-base in uniform (u.base).
-    fn bgl(
+    /// bind from pre-built BindingResources (Phase-2 sliced/windowed binds).
+    fn bind3(
         &self,
         dev: &WgpuDevice,
-        b0: &wgpu::Buffer,
-        b0_off: u64,
-        b1: &wgpu::Buffer,
-        b1_off: u64,
-        b2: &wgpu::Buffer,
+        r0: wgpu::BindingResource<'_>,
+        r1: wgpu::BindingResource<'_>,
+        r2: wgpu::BindingResource<'_>,
     ) -> wgpu::BindGroup {
-        let r0 = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: b0,
-            offset: b0_off,
-            size: if b0_off == 0 { None } else { wgpu::BufferSize::new(b0.size() - b0_off) },
-        });
-        let r2 = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: b2,
-            offset: 0,
-            size: None,
-        });
-        let r1 = if b1_off == 0 {
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: b1,
-                offset: 0,
-                size: None,
-            })
-        } else {
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: b1,
-                offset: b1_off,
-                size: wgpu::BufferSize::new(b1.size() - b1_off),
-            })
-        };
         dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.bgl,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: r0,
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: r1,
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: r2,
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.uni.as_entire_binding(),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: r0 },
+                wgpu::BindGroupEntry { binding: 1, resource: r1 },
+                wgpu::BindGroupEntry { binding: 2, resource: r2 },
+                wgpu::BindGroupEntry { binding: 3, resource: self.uni.as_entire_binding() },
             ],
         })
     }
@@ -326,14 +291,14 @@ pub fn eq_vec_host(xis: &[[u32; 4]]) -> Vec<u32> {
 /// table (512 MiB at j=25) by splitting y = (p << LOW) | e into
 /// eq[y] = eq_low[e] * eq_high[p], with LOW = 20 (16 MiB tables at most),
 /// uploading one 2^LOW-entry block (16 MiB) at a time.
-fn eq_upload_split(dev: &WgpuDevice, eqv: &wgpu::Buffer, xis: &[[u32; 4]]) {
+fn eq_upload_split(dev: &WgpuDevice, eqv: &ShardBuf, xis: &[[u32; 4]]) {
     const LOW: usize = 20;
     if xis.len() <= LOW {
         let eq = eq_vec_host(xis);
         let mut bo = 0usize;
         while bo < eq.len() {
             let be = (bo + (1usize << 22)).min(eq.len());
-            dev.queue.write_buffer(eqv, (bo * 4) as u64, &u32s_to_bytes(&eq[bo..be]));
+            eqv.write_slice(dev, (bo * 4) as u64, &u32s_to_bytes(&eq[bo..be]));
             bo = be;
         }
         return;
@@ -351,7 +316,7 @@ fn eq_upload_split(dev: &WgpuDevice, eqv: &wgpu::Buffer, xis: &[[u32; 4]]) {
                 bytes.extend_from_slice(&w.to_le_bytes());
             }
         }
-        dev.queue.write_buffer(eqv, (p << LOW) as u64 * 16, &bytes);
+        eqv.write_slice(dev, (p << LOW) as u64 * 16, &bytes);
     }
 }
 
@@ -496,6 +461,26 @@ fn download_n(dev: &WgpuDevice, buf: &wgpu::Buffer, n: u64) -> Vec<u8> {
 
 // ---------------- instance driver ----------------
 
+/// sliced BindingResource with EXPLICIT length (Phase-2 binds: never bind
+/// past the device's storage-binding cap).
+fn bres(b: &wgpu::Buffer, off: u64, len: u64) -> wgpu::BindingResource<'_> {
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: b,
+        offset: off,
+        size: Some(unsafe { NonZeroU64::new_unchecked(len.max(4)) }),
+    })
+}
+
+/// (nchunks, chunk_bytes) for a 2^t-row leaf: ONE GKR unpack window per
+/// chunk (chunk = 4*wsz rows x 32 B). ANV default: 4 x 512 MiB;
+/// WebGPU-floor device (wsz=2^19, t=26): 32 x 64 MiB.
+pub fn leaf_chunks(dev: &WgpuDevice, t: u32) -> (u32, u64) {
+    let wsz = dev.gkr_wsz() as u64;
+    let nchunks = ((1u64 << (t - 2)) / wsz).max(1);
+    let chunk_rows = (1u64 << t) / nchunks;
+    (nchunks as u32, chunk_rows * 32)
+}
+
 /// Run one full GKR instance on the GPU; returns canonical outputs.
 /// All buffers are dropped on return (memory law: free between runs).
 pub fn run_instance(
@@ -518,11 +503,9 @@ pub fn run_instance(
     }
     let raw_bytes = u32s_to_bytes(&raw);
 
-    // 2) leaf level buffer(s) (512 MiB cap per buffer; keeps 1D workgroup counts <= 65535)
-    let cap: u64 = 1 << 29;
-    let leaf_size = n as u64 * 32;
-    let nchunks = ((leaf_size + cap - 1) / cap).max(1) as u32;
-    let per_chunk = leaf_size / nchunks as u64; // bytes
+    // 2) leaf level buffer(s): one unpack window per chunk, sized so the
+    // whole chunk binds legally under the device's binding cap.
+    let (nchunks, per_chunk) = leaf_chunks(dev, t);
     let mut leaf_bufs: Vec<wgpu::Buffer> = Vec::new();
     for c in 0..nchunks {
         let b = dev.device.create_buffer(&wgpu::BufferDescriptor {
@@ -555,18 +538,22 @@ pub fn run_instance_gpu(
     let nchunks = leaf_bufs.len() as u32;
 
     // 3) level buffers 1..=t-1 (level L = 2^L Fracs, node-index order)
-    let mut levels: Vec<wgpu::Buffer> = (1..t)
+    let mut levels: Vec<ShardBuf> = (1..t)
         .map(|l| {
-            dev.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("gkr-lvl{}", l)),
-                size: (1u64 << l) * 32,
-                usage: BU::STORAGE | BU::COPY_DST | BU::COPY_SRC,
-                mapped_at_creation: false,
-            })
+            ShardBuf::new(
+                dev,
+                &format!("gkr-lvl{}", l),
+                BU::STORAGE | BU::COPY_DST | BU::COPY_SRC,
+                (1u64 << l) * 32,
+            )
         })
         .collect();
 
     // 4) tree build: level L from level L+1 (L = t .. 2)
+    // Window size per dispatch: pairs <= win/64B (src = 64 B/pair) and
+    // <= 65535 workgroups. All binds are sliced pow2 windows with the
+    // kernel counting pairs from 0 (u.base = u.pad = 0).
+    let pmax: u32 = ((dev.win() / 64) as u32).min(65535 * 256).max(256);
     for l in (2..=t).rev() {
         let dst = &levels[(l - 1) as usize - 1];
         let th_full = 1u32 << (l - 1);
@@ -574,33 +561,49 @@ pub fn run_instance_gpu(
             // source = leaves (chunked); pairs per chunk feed the dst at base
             let per = th_full / nchunks;
             for c in 0..nchunks {
-                let base = (c as u32 * per) * 8;
-                pipe.set_uniform(dev, W_FRAC, [0; 4], [0; 4], 0, base, 0);
-                let bg = pipe.bgl(dev, &leaf_bufs[c as usize], 0, &pipe.dummy, 0, dst);
-                GkrPipeline::run(dev, &pipe.pipe_tree, &bg, (per + 255) / 256);
+                let mut done = 0u32;
+                while done < per {
+                    let pairs = (per - done).min(pmax);
+                    pipe.set_uniform(dev, W_FRAC, [0; 4], [0; 4], pairs, 0, 0);
+                    let bg = pipe.bind3(
+                        dev,
+                        bres(
+                            &leaf_bufs[c as usize],
+                            done as u64 * 64,
+                            pairs as u64 * 64,
+                        ),
+                        pipe.dummy.as_entire_binding(),
+                        dst.bind(
+                            dev,
+                            (c as u64 * per as u64 + done as u64) * 32,
+                            pairs as u64 * 32,
+                        ),
+                    );
+                    GkrPipeline::run(dev, &pipe.pipe_tree, &bg, pairs.div_ceil(256));
+                    done += pairs;
+                }
             }
         } else {
-            // single src buffer; split into <= 65535-workgroup dispatches (u.base offsets)
             let src = &levels[(l - 1) as usize];
             let mut done = 0u32;
             while done < th_full {
-                let wgs = ((th_full - done + 255) / 256).min(65535);
-                let base = done * 8;
-                pipe.set_uniform(dev, W_FRAC, [0; 4], [0; 4], 0, base, done * 16);
-                let bg = pipe.bgl(dev, src, 0, &pipe.dummy, 0, dst);
-                GkrPipeline::run(dev, &pipe.pipe_tree, &bg, wgs);
-                done += wgs * 256;
+                let pairs = (th_full - done).min(pmax);
+                pipe.set_uniform(dev, W_FRAC, [0; 4], [0; 4], pairs, 0, 0);
+                let bg = pipe.bind3(
+                    dev,
+                    src.bind(dev, done as u64 * 64, pairs as u64 * 64),
+                    pipe.dummy.as_entire_binding(),
+                    dst.bind(dev, done as u64 * 32, pairs as u64 * 32),
+                );
+                GkrPipeline::run(dev, &pipe.pipe_tree, &bg, pairs.div_ceil(256));
+                done += pairs;
             }
         }
     }
 
     // 5) root + claims0 (level 1 = 2 Fracs = tree[2], tree[3]; projective Frac add)
     let lvl1 = &levels[0];
-    let lvl1_raw = download(dev, lvl1);
-    let u32s: Vec<u32> = lvl1_raw
-        .chunks(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
+    let u32s = lvl1.read_words(dev, 0, lvl1.size / 4);
     let p2 = [u32s[0], u32s[1], u32s[2], u32s[3]];
     let q2 = [u32s[4], u32s[5], u32s[6], u32s[7]];
     let p3 = [u32s[8], u32s[9], u32s[10], u32s[11]];
@@ -618,9 +621,7 @@ pub fn run_instance_gpu(
         };
         for lvl in dump_lvls {
             if (lvl as usize) <= levels.len() {
-                let bytes = download(dev, &levels[(lvl as usize) - 1]);
-                let words: Vec<u32> = bytes.chunks(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+                let words = levels[(lvl as usize) - 1].read_all(dev);
                 let canon = raw_to_canon(&words);
                 let cbytes: Vec<u8> = canon.iter().flat_map(|w| w.to_le_bytes()).collect();
                 let _ = std::fs::create_dir_all(&dir);
@@ -655,10 +656,9 @@ pub fn run_instance_gpu(
         let mut off = 0u64;
         while off < lvl_bytes {
             let n = (1u64 << 20).min(lvl_bytes - off);
-            let bytes = download_off(dev, &levels[(lvl as usize) - 1], off, n);
-            let cbytes: Vec<u8> = bytes
-                .chunks(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            let cbytes: Vec<u8> = levels[(lvl as usize) - 1]
+                .read_words(dev, off / 4, n / 4)
+                .into_iter()
                 .flat_map(|w| decode(w).to_le_bytes())
                 .collect();
             hasher.update(&cbytes);
@@ -674,10 +674,18 @@ pub fn run_instance_gpu(
         });
     }
 
-    // 7) 4-slot 64MiB window pool (2^22 rows x 160B; <= 1GiB law) + eqv + spart
-    let wsz: u32 = 1 << 22; // window rows (64 MiB per pool slot)
+    // 7) window pool: one wsz-row window (160 B/row) per slot. wsz = 2^22
+    // (640 MiB slots) on ANV, 2^19 (80 MiB) under WebGPU-floor limits.
+    // Slot count covers the largest round window count (nwin max =
+    // 2^(t-2)/wsz; ANV: 4, floors t=26: 32 x 80 MiB = 2.5 GiB < ANV's 4 x
+    // 640 MiB). + eqv (sharded) + spart.
+    let wsz: u32 = dev.gkr_wsz();
     let pool_size = wsz as u64 * (ROW10 as u64) * 4;
-    let pool: Vec<wgpu::Buffer> = (0..6)
+    // Slot allocator at each fold stage needs ALL nwin input windows live
+    // simultaneously + 1 free (pending set excludes future inputs). Max
+    // nwin occurs at the first fold (rows = 2^(t-1)): nslots = nwin + 2.
+    let nslots: u32 = (((1u64 << (t - 1)) / wsz as u64) + 2).max(6) as u32;
+    let pool: Vec<wgpu::Buffer> = (0..nslots)
         .map(|c| {
             dev.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("gkr-win{}", c)),
@@ -687,12 +695,12 @@ pub fn run_instance_gpu(
             })
         })
         .collect();
-    let eqv = dev.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gkr-eqv"),
-        size: (1u64 << (t - 1)) * 16,
-        usage: BU::STORAGE | BU::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let eqv = ShardBuf::new(
+        dev,
+        "gkr-eqv",
+        BU::STORAGE | BU::COPY_DST,
+        (1u64 << (t - 1)) * 16,
+    );
     let spart_max = if t - 2 >= 9 {
         1u64 << (t - 2 - 9)
     } else {
@@ -742,11 +750,7 @@ pub fn run_instance_gpu(
             dbg_lines.push(format!("lam_raw {:?}", lam));
             dbg_lines.push(format!("xis_raw {:?}", xis));
             if j + 1 < t {
-                let lb = download(dev, &levels[1]);
-                let lw: Vec<u32> = lb
-                    .chunks(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                    .collect();
+                let lw = levels[1].read_all(dev);
                 dbg_lines.push(format!("lvl{}{:?}", j + 1, raw_to_canon(&lw)));
             }
         }
@@ -755,7 +759,7 @@ pub fn run_instance_gpu(
         // 6 slots: a 4->2 window fold needs 4 live inputs + 2 fresh
         // outputs (AT5 bug: with 4 slots the w=0 output clobbered w=1's
         // still-pending input window, corrupting round-25 s_evals).
-        let mut slots: Vec<u32> = (0..6).collect();
+        let mut slots: Vec<u32> = (0..nslots).collect();
         let mut r_cur = 1u32 << (j - 1); // current row count
         // AT5 bug: nwin=1 hardcoded overflowed the 2^22-row pool slots once
         // rows (2^(j-1)) exceeded wsz (t=26 circuits, rounds 24-25).
@@ -766,22 +770,25 @@ pub fn run_instance_gpu(
         {
             let rows_w = r_cur / nwin;
             for w in 0..nwin {
-                let b0: &wgpu::Buffer;
-                let b0_off: u64;
-                if j + 1 == t {
-                    b0 = &leaf_bufs[w as usize];
-                    b0_off = 0;
-                } else {
-                    b0 = &levels[1]; // level-(j+1) always sits at index 1 after earlier removes
-                    b0_off = w as u64 * rows_w as u64 * 128; // 4 Fracs/row
-                }
-                let eq_off = w as u64 * rows_w as u64 * 32; // 8 u32/row
+                let eq_base = w as u64 * rows_w as u64 * 32; // 8 u32/row
                 let dst = &pool[slots[w as usize] as usize];
                 let mut done = 0u32;
                 while done < rows_w {
                     let wgs = ((rows_w - done + 255) / 256).min(65535);
+                    let rows_disp = ((rows_w - done) as u64).min(wgs as u64 * 256);
+                    // level-(j+1) always sits at index 1 after earlier removes
+                    let r0 = if j + 1 == t {
+                        bres(&leaf_bufs[w as usize], done as u64 * 128, rows_disp * 128)
+                    } else {
+                        levels[1].bind(
+                            dev,
+                            w as u64 * rows_w as u64 * 128 + done as u64 * 128,
+                            rows_disp * 128,
+                        )
+                    };
+                    let r1 = eqv.bind(dev, eq_base + done as u64 * 32, rows_disp * 32);
                     pipe.set_uniform(dev, W_FRAC, lam, [0; 4], rows_w, (done * 40) as u32, 0);
-                    let bg = pipe.bgl(dev, b0, b0_off, &eqv, eq_off, dst);
+                    let bg = pipe.bind3(dev, r0, r1, dst.as_entire_binding());
                     GkrPipeline::run(dev, &pipe.pipe_unpack, &bg, wgs);
                     done += wgs * 256;
                 }
@@ -808,10 +815,15 @@ pub fn run_instance_gpu(
                 let blocks = if rows_w >= 512 { rows_w / 512 } else { 1 };
                 let sbase_dbg: u32 = if dbg_on && k == 0 && w == 0 { 43981 } else { 0 };
                 pipe.set_uniform(dev, W_STRIPLE, lam, r, rows_w, 0, sbase_dbg);
-                let bg = pipe.bgl(dev, src, 0, &pipe.dummy, 0, &spart_a);
+                let bg = pipe.bind3(
+                    dev,
+                    src.as_entire_binding(),
+                    pipe.dummy.as_entire_binding(),
+                    spart_a.as_entire_binding(),
+                );
                 GkrPipeline::run(dev, &pipe.pipe_seval, &bg, blocks);
                 if dbg_on && k == 0 && w == 0 {
-                    let rb = download_n(dev, &spart_a, (100 * 4).min(spart_a.size()));
+                    let rb = download_n(dev, &spart_a, (156 * 4).min(spart_a.size()));
                     let rw: Vec<u32> = rb
                         .chunks(4)
                         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -820,14 +832,22 @@ pub fn run_instance_gpu(
                         dbg_lines.push(format!("vraw_mont {:?}", &rw[48..60]));
                     }
                     if rw.len() >= 100 {
-                        dbg_lines.push(format!("x2dbg_mont {:?}", &rw[60..100]));
+                        dbg_lines.push(format!("x2dbg_mont {:?}", raw_to_canon(&rw[60..100])));
+                    }
+                    if rw.len() >= 156 {
+                        dbg_lines.push(format!("treedbg_mont {:?}", raw_to_canon(&rw[140..156])));
                     }
                 }
                 let mut nblk = blocks;
                 let (mut sa, mut sb) = (&spart_a, &spart_b);
                 while nblk > 1 {
                     pipe.set_uniform(dev, W_STRIPLE, lam, r, rows_w, 0, 0);
-                    let bg = pipe.bgl(dev, sa, 0, &pipe.dummy, 0, sb);
+                    let bg = pipe.bind3(
+                        dev,
+                        sa.as_entire_binding(),
+                        pipe.dummy.as_entire_binding(),
+                        sb.as_entire_binding(),
+                    );
                     GkrPipeline::run(dev, &pipe.pipe_tree, &bg, ((nblk / 2) as u32 + 255) / 256);
                     std::mem::swap(&mut sa, &mut sb);
                     nblk /= 2;
@@ -840,11 +860,24 @@ pub fn run_instance_gpu(
                 if dbg_on && k == 0 && w == 0 {
                     dbg_lines.push(format!("spart0 {:?}", raw_to_canon(&su32)));
                 }
+                if std::env::var("W2A_TRACE").is_ok() && j <= 4 {
+                    eprintln!(
+                        "TRACE j={j} k={k} rows_w={rows_w} nwin={nwin} r_cur={r_cur} blocks={blocks} su32={:?} seval0={:?}",
+                        &su32[..8.min(su32.len())],
+                        &raw_to_canon(&s_acc)[..4.min(s_acc.len())]
+                    );
+                }
                 for (a, b) in s_acc.iter_mut().zip(su32.iter()) {
                     *a = fadd(*a, *b);
                 }
             }
 
+            if std::env::var("W2A_TRACE2").is_ok() && j == 2 && k == 0 {
+                let pr = download_off(dev, &pool[slots[0] as usize], 0, 320);
+                let pw: Vec<u32> = pr.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+                eprintln!("TRACE2 poolrow0_1={:?}", &raw_to_canon(&pw)[..20.min(pw.len())]);
+                eprintln!("TRACE2 lvl_head={:?}", &levels[1].read_words(dev, 0, 8));
+            }
             let s_evals = raw_to_canon(&s_acc);
             if dbg_on && k == 0 {
                 dbg_lines.push(format!("s_acc {:?}", s_evals));
@@ -862,7 +895,7 @@ pub fn run_instance_gpu(
                     let in0 = slots[(k * w) as usize];
                     let in1 = if k == 2 { slots[(k * w + 1) as usize] } else { in0 };
                     let pending: Vec<u32> = slots[((k * w) as usize + k as usize)..(nwin as usize)].to_vec();
-                    let out = (0..6u32).find(|i| *i != in0 && *i != in1 && !new_slots.contains(i) && !pending.contains(i)).unwrap();
+                    let out = (0..nslots).find(|i| *i != in0 && *i != in1 && !new_slots.contains(i) && !pending.contains(i)).unwrap();
                     new_slots.push(out);
                     // dispatch m: input window (k*w + m) -> output rows [m*rows_w_out/2 ...]
                     // each input window has 2*rows_w_out rows (k=2) -> rows_w_out out rows
@@ -880,7 +913,12 @@ pub fn run_instance_gpu(
                         while done < half {
                             let wgs = ((half - done + 255) / 256).min(65535);
                             pipe.set_uniform(dev, W_FRAC, lam, r, half, ((off + done as u64 * 40) as u32), 0);
-                            let bg = pipe.bgl(dev, src, 0, &pipe.dummy, 0, dst);
+                            let bg = pipe.bind3(
+                                dev,
+                                src.as_entire_binding(),
+                                pipe.dummy.as_entire_binding(),
+                                dst.as_entire_binding(),
+                            );
                             GkrPipeline::run(dev, &pipe.pipe_fold, &bg, wgs);
                             done += wgs * 256;
                         }
@@ -1033,4 +1071,75 @@ pub fn check_snapshots(_inst: &GkrInstance, out: &GkrOutputs, inputs_dir: &Path)
         }
     }
     m
+}
+#[cfg(test)]
+mod seval_micro_tests {
+    use super::*;
+
+    /// Replay agg-leaf r2 (rows 0-1, lam from dbg) directly through
+    /// pipe_seval; expected spart = golden [790040390, 430551731, ...].
+    #[test]
+    fn seval_pair_replay() {
+        let row01: [u32; 80] = [595834354, 732908907, 684368567, 1930617988, 1159597387, 1425279555, 612323965, 834472346, 936940859, 939081072, 134873979, 922914657, 1227610087, 135176543, 1849176746, 1190405903, 257346266, 1441918344, 225573001, 991005037, 1432915987, 1756303729, 579993599, 1546432696, 1942537645, 776071076, 1323791147, 442811544, 495282974, 1189887971, 1544107344, 524028928, 143653583, 752259352, 1477218815, 674342250, 6285683, 455970147, 1599723998, 1367144960, 231556760, 1328778703, 1007685622, 1485122408, 26277421, 539564677, 1722153688, 1789585021, 490002816, 1452212714, 1680721424, 1294375567, 822140766, 1444066503, 1544086663, 1790668459, 1997027410, 318724680, 919576661, 105971627, 0, 0, 0, 0, 1905717363, 829453714, 184413351, 1741975069, 203606886, 274642633, 1387889115, 1361056572, 1588111336, 1416348283, 161659536, 40406250, 229552718, 1314133020, 1976436645, 447596186];
+        let lam = [69905339u32, 683653480, 1098732639, 801423575];
+        let dev = crate::device::WgpuDevice::init(crate::device::InitOpts {
+            require_intel_arc: true,
+            allow_u32_only: true,
+            device_substring: None,
+        });
+        let pipe = GkrPipeline::new(&dev);
+        let rows = 512usize;
+        let mut raw = vec![0u32; rows * 40];
+        for i in 0..80 {
+            raw[i] = crate::field::encode(row01[i]);
+        }
+        let poolbuf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("micro-pool"),
+            size: (rows * 160) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        dev.queue.write_buffer(&poolbuf, 0, &u32s_to_bytes(&raw));
+        let spart = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("micro-spart"),
+            size: 4096,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        pipe.set_uniform(&dev, W_STRIPLE, lam, [0u32; 4], 2, 0, 0);
+        let bg = pipe.bind3(
+            &dev,
+            poolbuf.as_entire_binding(),
+            pipe.dummy.as_entire_binding(),
+            spart.as_entire_binding(),
+        );
+        let dispatch = |rawv: &Vec<u32>, nrows: u32, dev: &crate::device::WgpuDevice| -> Vec<u32> {
+            dev.queue.write_buffer(&poolbuf, 0, &u32s_to_bytes(rawv));
+            pipe.set_uniform(&dev, W_STRIPLE, lam, [0u32; 4], nrows, 0, 0);
+            let bg = pipe.bind3(
+                &dev,
+                poolbuf.as_entire_binding(),
+                pipe.dummy.as_entire_binding(),
+                spart.as_entire_binding(),
+            );
+            GkrPipeline::run(&dev, &pipe.pipe_seval, &bg, 1);
+            let out = download_n(&dev, &spart, 4096);
+            let w: Vec<u32> = out.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            let mut c = raw_to_canon(&w);
+            c.truncate(4);
+            let lane1 = raw_to_canon(&w[160..164]);
+            println!("SEVALTEST   lane1_v1={:?} probe=[{} {} {} {}] canary=[{} {} {} {}] blk0={:?} blk1={:?} blk2={:?} id0={} id1={}", &lane1[..1], w[164], w[165], w[166], w[167], w[176], w[177], w[178], w[179], &w[0..12], &w[12..24], &w[24..36], w[184], w[185]);
+            c
+        };
+        let mut r0only = vec![0u32; rows * 40];
+        r0only[..40].copy_from_slice(&raw[..40]);
+        let mut r1only = vec![0u32; rows * 40];
+        r1only[..40].copy_from_slice(&raw[40..80]);
+        println!("SEVALTEST r0-only n1 = {:?}", &dispatch(&r0only, 1, &dev)[..3]);
+        println!("SEVALTEST r1-only n1 = {:?}", &dispatch(&r1only, 1, &dev)[..3]);
+        println!("SEVALTEST r0row-as-r1 n2 = {:?}", &dispatch(&{ let mut v = raw.clone(); v[40..80].copy_from_slice(&raw[..40]); v[0..40].copy_from_slice(&raw[..40]); v }, 2, &dev)[..3]);
+        let c = dispatch(&raw, 2, &dev);
+        println!("SEVALTEST canon={:?}", &c[..3]);
+        assert_eq!(&c[..3], &[790040390u32, 430551731, 201269746], "seval pair replay mismatch");
+    }
 }

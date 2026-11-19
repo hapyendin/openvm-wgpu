@@ -71,7 +71,8 @@ Runs on any Vulkan-capable GPU exposing `SHADER_INT64` (NVIDIA, AMD/RADV, Intel/
 - ✅ cross-vendor proof: zero WGSL edits between Arc and NVIDIA; 5/5 matrix rows byte-identical incl. the full prove (see [portability matrix](#portability-matrix-arc-b70--tree-of-record-runs-nvidia-a16--farm-recheck-plain-vulkan))
 - ✅ capability-driven adapter selection (W1): enumerate, score, pin, fail closed
 - ✅ spec-portable u32-limb field path wired end-to-end: with `OPENVM_WGPU_FORCE_U32=1` (zero int64 features requested), the **entire gate ladder up to the full proof reproduces byte-identical** — 16.7M-pair host proof of the emulated REDC, u32 kernels within ~5% of u64 on Arc (memory-bound)
-- 🔜 browser/WebGPU tier: 128 MiB storage-binding sharding + wasm harness (math done, plumbing next)
+- ✅ WebGPU browser-tier compliance mode: with `OPENVM_WGPU_WEBGPU_LIMITS=1` (+ `OPENVM_WGPU_FORCE_U32=1`) the device is pinned to WebGPU spec-floor limits (128 MiB storage binding, 256 MiB buffer, 16 KiB workgroup memory, 256 invocations/workgroup) and wgpu's own validation audits every allocation. All buffers >floor transparently shard (pow2 windows ≤ binding cap, `ShardBuf`/`leaf_chunks`); **the full ladder incl. the ~2 GiB-leaf proof runs byte-identical under the floors with no measurable perf cost**. This is a native self-test for browser-tier feasibility — oversized bindings panic instead of silently passing.
+- 🔜 browser/WebGPU tier phase 3: wasm build + async init/mapAsync, bind-group atlases, u32-CAS grind (sharding done)
 - 🔜 third-silicon validation: AMD/RADV, Apple/Metal — gate suite ready (both mul paths), hardware calls welcome
 
 ## Portability matrix (Arc B70 = tree-of-record runs; NVIDIA A16 = farm recheck, plain Vulkan)

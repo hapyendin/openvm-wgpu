@@ -113,6 +113,8 @@ struct U {
 @compute @workgroup_size(256u)
 fn tree_add(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
+  // W=8 dispatch overshoot guard (u.h = pairs in this window bind)
+  if (u.w == 8u && i >= u.h) { return; }
   if (u.w == 8u) {
     let ao = u.pad + i * 16u; // src base (split dispatches)
     let doff = u.base + i * 8u;
@@ -141,6 +143,7 @@ fn tree_add(@builtin(global_invocation_id) gid: vec3<u32>) {
 @compute @workgroup_size(256u)
 fn unpack(@builtin(global_invocation_id) gid: vec3<u32>) {
   let y = gid.x;
+  if (y >= u.h) { return; } // u.h = rows in this window bind
   let ro = u.base + y * 40u;
   let so = y * 32u;
   let eo = y * 8u;
@@ -166,8 +169,11 @@ fn unpack(@builtin(global_invocation_id) gid: vec3<u32>) {
   dst[ro + 36u] = q1o.x; dst[ro + 37u] = q1o.y; dst[ro + 38u] = q1o.z; dst[ro + 39u] = q1o.w;
 }
 
-// 512 y's per workgroup (1536 vec4 = 24KB workgroup memory < 32KB limit)
-var<workgroup> ws: array<vec4<u32>, 1536u>;
+// 512 y's per workgroup via 256 threads x 2 rows (WebGPU spec floor:
+// <= 256 invocations and <= 16 KiB workgroup memory; 768 vec4 = 12 KiB).
+// The per-block summation ORDER is unchanged (tree over the same 512
+// fpart rows), so block partials are bit-identical to the 512-thread tile.
+var<workgroup> ws: array<vec4<u32>, 768u>;
 
 fn fpart(row: Row10, cx: u32) -> vec4<u32> {
   var p0: vec4<u32>; var p1: vec4<u32>; var q0: vec4<u32>; var q1: vec4<u32>; var eq: vec4<u32>;
@@ -187,60 +193,52 @@ fn fpart(row: Row10, cx: u32) -> vec4<u32> {
   return emul(eq, eadd(pprev, emul(u.lam, qprev)));
 }
 
-// per-y s(1),s(2),s(3) partials + 512-y workgroup tree -> spart[block] (12 u32)
-@compute @workgroup_size(512u)
+fn load_row(bo: u32) -> Row10 {
+  var row: Row10;
+  row.eqe = vec4<u32>(src[bo], src[bo+1u], src[bo+2u], src[bo+3u]);
+  row.equ = vec4<u32>(src[bo+4u], src[bo+5u], src[bo+6u], src[bo+7u]);
+  row.p0e = vec4<u32>(src[bo+8u], src[bo+9u], src[bo+10u], src[bo+11u]);
+  row.p1e = vec4<u32>(src[bo+12u], src[bo+13u], src[bo+14u], src[bo+15u]);
+  row.p0o = vec4<u32>(src[bo+16u], src[bo+17u], src[bo+18u], src[bo+19u]);
+  row.p1o = vec4<u32>(src[bo+20u], src[bo+21u], src[bo+22u], src[bo+23u]);
+  row.q0e = vec4<u32>(src[bo+24u], src[bo+25u], src[bo+26u], src[bo+27u]);
+  row.q0o = vec4<u32>(src[bo+28u], src[bo+29u], src[bo+30u], src[bo+31u]);
+  row.q1e = vec4<u32>(src[bo+32u], src[bo+33u], src[bo+34u], src[bo+35u]);
+  row.q1o = vec4<u32>(src[bo+36u], src[bo+37u], src[bo+38u], src[bo+39u]);
+  return row;
+}
+
+// per-y s(1),s(2),s(3) partials + block tree -> spart[block] (12 u32).
+// SPEC-FLOOR TILE: 256 invocations, ws = 768 vec4 = 12 KiB. Bit-identical
+// to the historical 512-thread/1536-vec4 tile: the old tree's first step
+// paired lane i with lane i+256 (rows b*512+i and b*512+i+256), so each
+// output block covers 256 rows [b*256+i, +256] with lane row FIRST in
+// every eadd; here that first step is the per-thread pre-sum, then the
+// identical s=128..1 butterfly runs over 256 lanes.
+@compute @workgroup_size(256u)
 fn seval(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let y = gid.x;
   // u.h carries the number of valid rows in this window (host passes rows_w).
   let n = u.h;
-  var row: Row10;
-  let bo = y * 40u;
-  if (y < n) {
-    row.eqe = vec4<u32>(src[bo], src[bo+1u], src[bo+2u], src[bo+3u]);
-    row.equ = vec4<u32>(src[bo+4u], src[bo+5u], src[bo+6u], src[bo+7u]);
-    row.p0e = vec4<u32>(src[bo+8u], src[bo+9u], src[bo+10u], src[bo+11u]);
-    row.p1e = vec4<u32>(src[bo+12u], src[bo+13u], src[bo+14u], src[bo+15u]);
-    row.p0o = vec4<u32>(src[bo+16u], src[bo+17u], src[bo+18u], src[bo+19u]);
-    row.p1o = vec4<u32>(src[bo+20u], src[bo+21u], src[bo+22u], src[bo+23u]);
-    row.q0e = vec4<u32>(src[bo+24u], src[bo+25u], src[bo+26u], src[bo+27u]);
-    row.q0o = vec4<u32>(src[bo+28u], src[bo+29u], src[bo+30u], src[bo+31u]);
-    row.q1e = vec4<u32>(src[bo+32u], src[bo+33u], src[bo+34u], src[bo+35u]);
-    row.q1o = vec4<u32>(src[bo+36u], src[bo+37u], src[bo+38u], src[bo+39u]);
-  }
-  var v1: vec4<u32>; var v2: vec4<u32>; var v3: vec4<u32>;
-  if (y < n) {
+  let wgid = gid.x >> 8u;          // 256 invocations per workgroup
+  let yb = wgid * 512u + lid.x;    // lane row (block = wgid, 512 rows)
+  let yb2 = yb + 256u;             // pair row (old lane lid.x + 256)
+  var v1 = vec4<u32>(0u); var v2 = vec4<u32>(0u); var v3 = vec4<u32>(0u);
+  if (yb < n) {
+    let row = load_row(yb * 40u);
     v1 = fpart(row, X1);
     v2 = fpart(row, X2);
     v3 = fpart(row, X3);
-  } else {
-    v1 = vec4<u32>(0u); v2 = vec4<u32>(0u); v3 = vec4<u32>(0u);
   }
-  if (u.pad == 43981u && lid.x == 0u) {
-    dst[48u] = v1.x;  dst[49u] = v1.y;  dst[50u] = v1.z;  dst[51u] = v1.w;
-    dst[52u] = v2.x;  dst[53u] = v2.y;  dst[54u] = v2.z;  dst[55u] = v2.w;
-    dst[56u] = v3.x;  dst[57u] = v3.y;  dst[58u] = v3.z;  dst[59u] = v3.w;
-    let dp0 = lerp4(row.p0e, row.p0o, X2);
-    let dp1 = lerp4(row.p1e, row.p1o, X2);
-    let dq0 = lerp4(row.q0e, row.q0o, X2);
-    let dq1 = lerp4(row.q1e, row.q1o, X2);
-    let deq = lerp4(row.eqe, row.equ, X2);
-    let dS = eadd(eadd(emul(dp0, dq1), emul(dp1, dq0)), emul(u.lam, emul(dq0, dq1)));
-    let dd = esub(row.p0o, row.p0e);
-    let mp = emul(dd, vec4<u32>(X2, 0u, 0u, 0u));
-    let dde = esub(row.equ, row.eqe);
-    let mpe = emul(dde, vec4<u32>(X2, 0u, 0u, 0u));
-    let mm0 = mul(row.p0o.z, X2);
-    let o4 = array<vec4<u32>, 10u>(dp0, dd, mp, dde, mpe, row.p0e, row.eqe, row.equ, deq, dS);
-    for (var m: u32 = 0u; m < 10u; m = m + 1u) {
-      let vv = o4[m];
-      let b = 60u + m * 4u;
-      dst[b] = vv.x; dst[b + 1u] = vv.y; dst[b + 2u] = vv.z; dst[b + 3u] = vv.w;
-    }
+  if (yb2 < n) {
+    let row2 = load_row(yb2 * 40u);
+    v1 = eadd(v1, fpart(row2, X1));
+    v2 = eadd(v2, fpart(row2, X2));
+    v3 = eadd(v3, fpart(row2, X3));
   }
   let t = lid.x * 3u;
   ws[t] = v1; ws[t + 1u] = v2; ws[t + 2u] = v3;
   workgroupBarrier();
-  var s: u32 = 256u;
+  var s: u32 = 128u;
   for (; s >= 1u; s = s >> 1u) {
     if (lid.x < s) {
       let t2 = lid.x * 3u;
@@ -251,7 +249,7 @@ fn seval(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
     workgroupBarrier();
   }
   if (lid.x == 0u) {
-    let block = u32(gid.x >> 9u);
+    let block = wgid;
     dst[block * 12u] = ws[0].x; dst[block * 12u + 1u] = ws[0].y;
     dst[block * 12u + 2u] = ws[0].z; dst[block * 12u + 3u] = ws[0].w;
     dst[block * 12u + 4u] = ws[1].x; dst[block * 12u + 5u] = ws[1].y;
@@ -268,6 +266,7 @@ fn seval(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocatio
 @compute @workgroup_size(256u)
 fn fold(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x;
+  if (i >= u.h) { return; } // u.h = output rows in this window
   let so = i * 80u;            // row 2i    (2i * 40)
   let bo = i * 80u + 40u;      // row 2i+1
   let ro = u.base + i * 40u;   // dst base (window split)

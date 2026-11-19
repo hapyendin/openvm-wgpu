@@ -23,6 +23,7 @@ use wgpu::BufferUsages as BU;
 
 use crate::device::WgpuDevice;
 use crate::field::{decode, encode};
+use crate::limitsbuf::ShardBuf;
 
 pub const LOGUP_WGSL: &str = r#"
 const PP: u32 = 2013265921u;
@@ -145,7 +146,12 @@ fn dag_rows(@builtin(global_invocation_id) gid: vec3<u32>,
         let part = ib >> 1u;
         let rot = ib & 1u;
         let rr = select(r, r2, rot == 1u && need_rot == 1u);
-        v = src[src[pmeta + npart + part] + rr * src[pmeta + 2u * npart + part] + ic];
+        // trace cells come from the per-chunk window bound at src2:
+        // window layout = [0..64) per-part row bases (words), rows from 64.
+        // part p rows (cr+1 of them, starting at row c0 = u.w0) sit at
+        // 64 + winhdr[part] + (rr - c0)*stride_p + ic.
+        let sp = src[pmeta + 2u * npart + part];
+        v = src2[64u + src2[part] + (rr - u.w0) * sp + ic];
       }
     } else if (kind == 1u) { v = sel_f;
     } else if (kind == 2u) { v = sel_l;
@@ -280,7 +286,7 @@ impl LeafPipeline {
         }
     }
 
-    pub fn set_uniform(&self, dev: &WgpuDevice, w: [u32; 8], lam: [u32; 4], rx: u32) {
+    pub fn set_uniform(&self, dev: &WgpuDevice, w: [u32; 8], lam: [u32; 4], rx: u32, ry: u32) {
         let mut b = [0u8; 64];
         for (i, x) in w.iter().enumerate() {
             b[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
@@ -289,7 +295,27 @@ impl LeafPipeline {
             b[32 + i * 4..36 + i * 4].copy_from_slice(&x.to_le_bytes());
         }
         b[48..52].copy_from_slice(&rx.to_le_bytes());
+        b[52..56].copy_from_slice(&ry.to_le_bytes());
         dev.queue.write_buffer(&self.uni, 0, &b);
+    }
+
+    fn bg_res<'a>(
+        &self,
+        dev: &WgpuDevice,
+        r0: wgpu::BindingResource<'a>,
+        r1: wgpu::BindingResource<'a>,
+        r2: wgpu::BindingResource<'a>,
+    ) -> wgpu::BindGroup {
+        dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: r0 },
+                wgpu::BindGroupEntry { binding: 1, resource: r1 },
+                wgpu::BindGroupEntry { binding: 2, resource: r2 },
+                wgpu::BindGroupEntry { binding: 3, resource: self.uni.as_entire_binding() },
+            ],
+        })
     }
 
     fn bg(&self, dev: &WgpuDevice, b0: &wgpu::Buffer, b2: &wgpu::Buffer) -> wgpu::BindGroup {
@@ -453,7 +479,7 @@ pub fn build_leaf(
         let mut done = 0u64;
         while done < rpc_leaf {
             let cnt = (rpc_leaf - done).min(65535 * 256);
-            lp.set_uniform(dev, [(done * 8) as u32, cnt as u32, 0, 0, 0, 0, 0, 0], alpha4, 0);
+            lp.set_uniform(dev, [(done * 8) as u32, cnt as u32, 0, 0, 0, 0, 0, 0], alpha4, 0, 0);
             let bg = lp.bg(dev, &lp.dummy, cb);
             LeafPipeline::run(dev, &lp.p_fill_default, &bg, ((cnt + 255) / 256) as u32);
             done += cnt;
@@ -461,6 +487,7 @@ pub fn build_leaf(
     }
 
     // 2) per-air DAG + slot fills (sorted order as listed in world.airs)
+    eprintln!("LEAFB dagslots start");
     for air in &world.airs {
         let tables = std::fs::read(inputs_dir.join(&air.tables))
             .unwrap_or_else(|e| panic!("tables {}: {e}", air.tables));
@@ -470,17 +497,20 @@ pub fn build_leaf(
         // in 4 MiB-encoded chunks (peak host cost == chunk, not the full air
         // blob: the largest air's blob was 344 MiB resident pre-patch).
         let blob_len = tables.len() as u64 + air.trace_words * 4;
-        let blob_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("w2b-blob{}", air.air_id)),
-            size: blob_len,
-            usage: BU::STORAGE | BU::COPY_DST,
-            mapped_at_creation: false,
-        });
+        // Phase-2: the air blob can exceed both the 256 MiB buffer cap and
+        // the 128 MiB binding cap -> sharded; kernels read only a per-chunk
+        // trace window (copied device-side) plus the small tables slice.
+        let blob_buf = ShardBuf::new(
+            dev,
+            &format!("w2b-blob{}", air.air_id),
+            BU::STORAGE | BU::COPY_DST | BU::COPY_SRC,
+            blob_len,
+        );
         {
             let mut off = 0usize;
             while off < tables.len() {
                 let e = (off + (1 << 22)).min(tables.len());
-                dev.queue.write_buffer(&blob_buf, off as u64, &tables[off..e]);
+                blob_buf.write_slice(dev, off as u64, &tables[off..e]);
                 off = e;
             }
         }
@@ -516,7 +546,7 @@ pub fn build_leaf(
                         enc[i * 4..i * 4 + 4].copy_from_slice(&encode(w as u32).to_le_bytes());
                     }
                     let el = filled / 2;
-                    dev.queue.write_buffer(&blob_buf, off, &enc[..el]);
+                    blob_buf.write_slice(dev, off, &enc[..el]);
                     off += el as u64;
                     tw += (filled / 8) as u64;
                 }
@@ -526,50 +556,146 @@ pub fn build_leaf(
         }
         let _ = (&mut *cache, inputs_dir);
 
-        // out buffer layout: [scratch n_nodes*rpc | pnum nchunks*n_int*rpc |
-        //                     den nchunks*n_int*rpc*4]
+        // Phase-2 out layout: one ShardBuf of per-chunk REGIONS, each
+        // region = [scratch n_nodes*rpc | pnum n_int*rpc | den n_int*rpc*4]
+        // at pow2-padded stride (so regions never straddle a shard). The
+        // dag kernel binds exactly one region window; leaf_fill re-reads
+        // the same region window. Every bind <= device binding cap.
+        // per-part row strides (words/row) + count, from the header:
+        // part p base word at [pmeta+npart+p], stride at [pmeta+2npart+p]
+        let mut part_strides: Vec<u64> = Vec::new();
+        {
+            let mut hd = vec![0u8; (air.tblen as usize * 4).min(1 << 16).min(tables.len())];
+            // header (incl. pmeta) is the FIRST tblen words of the tables
+            // file itself — read directly from the tables bytes.
+            let n = hd.len().min(tables.len());
+            hd[..n].copy_from_slice(&tables[..n]);
+            let hw: Vec<u32> = hd.chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+            let npart = hw[3] as usize;
+            assert!(npart <= 64, "npart {npart} > 64");
+            let pmeta = hw[12] as usize;
+            for p in 0..npart {
+                part_strides.push(hw[pmeta + 2 * npart + p] as u64);
+            }
+        }
         let budget = 16u64 << 20; // 64 MiB scratch
-        let mut rpc = (budget / (air.n_nodes as u64 + 1)) & !255;
+        let wrow = air.trace_words / (air.h as u64).max(1); // trace words/row
+        let mut rpc = (budget / (air.n_nodes as u64 + 1))
+            .min(dev.win() / (4 * (air.n_nodes as u64 + 5 * air.n_int as u64 + 1)))
+            .min(if wrow > 0 { (dev.win() / 4 - 64) / wrow } else { 1 << 30 })
+            & !255;
         if rpc < 256 { rpc = 256; }
         if rpc > air.h as u64 { rpc = air.h as u64; }
         let nch = (air.h as u64 + rpc - 1) / rpc;
+        eprintln!("LEAFB air{} h={} rpc={} nch={} win={}", air.air_id, air.h, rpc, nch, dev.win());
         let scratch_w = air.n_nodes as u64 * rpc;
-        let pnum_w = nch * air.n_int as u64 * rpc;
-        let den_w = pnum_w * 4;
-        let out_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("w2b-dag{}", air.air_id)),
-            size: (scratch_w + pnum_w + den_w) * 4,
-            usage: BU::STORAGE | BU::COPY_DST | BU::COPY_SRC,
+        let region_w = (air.n_nodes as u64 + 5 * air.n_int as u64) * rpc;
+        let region_bytes = region_w * 4;
+        let region_pad = crate::device::pow2_floor(region_bytes - 1) * 2; // ceil pow2
+        assert!(region_pad <= dev.win(), "air{} region {region_bytes} exceeds window", air.air_id);
+        let out_shard = ShardBuf::new(
+            dev,
+            &format!("w2b-dag{}", air.air_id),
+            BU::STORAGE | BU::COPY_DST | BU::COPY_SRC,
+            (nch * region_pad).max(16),
+        );
+        // per-chunk trace window buffer: rows [c0, c0+cr] (rot +1 row)
+        let win_w = 64 + (rpc + 1) * wrow.max(part_strides.iter().sum::<u64>());
+        let win_buf = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("w2b-win{}", air.air_id)),
+            size: (win_w * 4).max(16),
+            usage: BU::STORAGE | BU::COPY_DST,
             mapped_at_creation: false,
         });
         let pbase = scratch_w as u32;
-        let dbase = (scratch_w + pnum_w) as u32;
+        let dbase = (scratch_w + air.n_int as u64 * rpc) as u32;
+        let tblen_w = air.tblen as u64;
         let mut c0 = 0u64;
         let mut cidx = 0u64;
         while c0 < air.h as u64 {
             let cr = rpc.min(air.h as u64 - c0) as u32;
+            // per-part device copy of trace rows [c0, c0+cr] into win_buf
+            // (row data starts at word 64; words [0..64) = part row bases)
+            {
+                let mut hdr = vec![0u32; 64];
+                let np = (air.widths.len() + air.trace_files.len()) * 0
+                    + air.trace_files.len(); // parts = trace files (pmeta count)
+                let _ = np;
+                // part p blob-trace-relative row start = cumulative h*width
+                let mut src_row0 = 0u64;
+                let mut win_word0 = 0u64;
+                let mut phdr: Vec<u32> = Vec::new();
+                for (pi, stride) in part_strides.iter().enumerate() {
+                    phdr.push(win_word0 as u32);
+                    let s0 = (tblen_w + src_row0 + c0 * stride) * 4;
+                    let len = ((cr as u64) + 1) * stride * 4;
+                    let mut d0 = 0u64;
+                    while d0 < len {
+                        let (si, so) = blob_buf.loc(s0 + d0);
+                        let mut take = (len - d0)
+                            .min(blob_buf.shards[si].size() - so)
+                            .min(win_buf.size() - (64 * 4 + win_word0 * 4 + d0));
+                        if take == 0 {
+                            // read landed on shard end (rot +1 row past the
+                            // final row of the trace) or window is full: the
+                            // unread window tail is zero padding by design
+                            // (rotate source absent for the final chunk).
+                            break;
+                        }
+                        if win_word0 + d0 / 4 + take / 4 + 65 > win_buf.size() / 4 {
+                            take = win_buf.size() - (64 * 4 + win_word0 * 4 + d0);
+                            if take == 0 { break; }
+                        }
+                        let mut enc = dev.device.create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor { label: Some("w2b-win-copy") });
+                        enc.copy_buffer_to_buffer(
+                            &blob_buf.shards[si], so,
+                            &win_buf, 64 * 4 + win_word0 * 4 + d0, take);
+                        dev.queue.submit(Some(enc.finish()));
+                        d0 += take;
+                    }
+                    let _ = pi;
+                    src_row0 += air.h as u64 * stride;
+                    win_word0 += (cr as u64 + 1) * stride;
+                }
+                hdr[..phdr.len()].copy_from_slice(&phdr);
+                dev.queue.write_buffer(&win_buf, 0, &crate::field::u32s_to_bytes(&hdr));
+            }
             lp.set_uniform(
                 dev,
                 [
                     c0 as u32,
                     cr,
                     0,
-                    (pbase as u64 + cidx * air.n_int as u64 * rpc) as u32,
-                    (dbase as u64 + cidx * air.n_int as u64 * rpc * 4) as u32,
+                    pbase,
+                    dbase,
                     intstride,
                     rpc as u32,
                     0,
                 ],
                 [0; 4],
                 0,
+                (tblen_w + c0 * wrow) as u32,
             );
-            let bg = lp.bg(dev, &blob_buf, &out_buf);
+            let bg = lp.bg_res(
+                dev,
+                blob_buf.bind(dev, 0, tblen_w * 4),
+                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &win_buf,
+                    offset: 0,
+                    size: Some(std::num::NonZeroU64::new((win_w * 4).max(16)).unwrap()),
+                }),
+                out_shard.bind(dev, cidx * region_pad, region_bytes),
+            );
             LeafPipeline::run(dev, &lp.p_dag, &bg, (cr + 255) / 256);
             c0 += rpc;
             cidx += 1;
+            if cidx % ((nch / 20).max(1)) == 0 { eprintln!("LEAFB air{} dag {}/{}", air.air_id, cidx, nch); }
         }
 
-        // slot fills for this air (regions may cross leaf-chunk boundaries)
+        // slot fills for this air (windows: one leaf chunk AND one dag chunk)
+        eprintln!("LEAFB air{} slots", air.air_id);
         for slot in world.slots.iter().filter(|s| s.air_id == air.air_id) {
             let len = 1u64 << slot.log_ht;
             let mut done = 0u64;
@@ -577,12 +703,14 @@ pub fn build_leaf(
                 let g = slot.row_idx + done; // global leaf row
                 let chunk = (g * 32 / per) as usize;
                 let crow0 = chunk as u64 * rpc_leaf;
-                let cap = (crow0 + rpc_leaf - g).min(len - done);
-                let cnt = cap.min(65535 * 256);
                 let hr = ((g - slot.row_idx) % slot.h as u64) as u32;
-                let cstride = air.n_int as u64 * rpc; // words (pnum units)
+                let dchunk = (hr as u64) / rpc; // dag chunk of this row
+                // stay inside leaf chunk AND dag chunk
+                let cap_leaf = (crow0 + rpc_leaf - g).min(len - done);
+                let cap_dag = (rpc - (hr as u64 % rpc)).min(cap_leaf);
+                let cnt = cap_dag.min(65535 * 256);
                 // kernel recomputes (hr+i) per row incl. chunk + wrap math,
-                // so bases exclude the hr offset:
+                // so bases are REGION-relative and exclude the hr offset:
                 let pb0 = pbase as u64 + (slot.j as u64) * rpc;
                 let db0 = dbase as u64 + (slot.j as u64) * rpc * 4;
                 lp.set_uniform(
@@ -598,9 +726,23 @@ pub fn build_leaf(
                         rpc as u32,
                     ],
                     alpha4,
-                    cstride as u32,
+                    0,
+                    0,
                 );
-                let bg = lp.bg(dev, &out_buf, &leaf[chunk]);
+                let bg = lp.bg_res(
+                    dev,
+                    out_shard.bind(dev, dchunk * region_pad, region_bytes),
+                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &lp.dummy,
+                        offset: 0,
+                        size: Some(std::num::NonZeroU64::new(16).unwrap()),
+                    }),
+                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &leaf[chunk],
+                        offset: 0,
+                        size: Some(std::num::NonZeroU64::new(per).unwrap()),
+                    }),
+                );
                 LeafPipeline::run(dev, &lp.p_leaf_fill, &bg, ((cnt + 255) / 256) as u32);
                 done += cnt;
             }
@@ -608,6 +750,7 @@ pub fn build_leaf(
     }
 
     // 3) canonical-form sha over the full leaf
+    eprintln!("LEAFB sha");
     let mut hasher = sha2::Sha256::new();
     let dump_dir = std::env::var("W2B_LEAF_DUMP").ok();
     for (ci, cb) in leaf.iter().enumerate() {

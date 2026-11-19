@@ -80,11 +80,6 @@ fn twiddles(n: usize, omega_canon: u32) -> Vec<u32> {
 }
 
 fn main() {
-    let argv: Vec<String> = std::env::args().collect();
-    if argv.iter().any(|a| a == "--list-adapters") {
-        wgpu_backend::adapters::list_adapters();
-        std::process::exit(0);
-    }
     // Input: LCG sequence
     let inp = gen_lcg(N, 0x5eed1234abcd0001u64);
     let inp_mont: Vec<u32> = inp.iter().map(|&x| encode(x)).collect();
@@ -114,7 +109,7 @@ fn main() {
     
     // GPU test
     let opts = InitOpts {
-        require_intel_arc: std::env::var("OPENVM_WGPU_ARC").is_ok(),
+        require_intel_arc: true,
         allow_u32_only: false,
         device_substring: wgpu_backend::adapters::device_substring_from_env(),
     };

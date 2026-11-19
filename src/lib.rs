@@ -3,6 +3,7 @@ pub mod device;
 pub mod field;
 pub mod gkr;
 pub mod gkr_wgsl;
+pub mod limitsbuf;
 pub mod logup_leaf;
 pub mod mat;
 pub mod pipeline;
@@ -61,14 +62,19 @@ impl WgpuBackend {
     }
 
     fn dispatch_chunked(&self, pipe: &wgpu::ComputePipeline, m: &WgpuMat, words: usize) {
-        // single-chunk fast path (all C2 sizes are single-chunk)
-        assert_eq!(m.chunks.len(), 1, "chunked dispatch = C3 work");
+        // Phase-2: multi-chunk dispatch. Every 16-word thread is fully
+        // independent (perm_batch guards on arrayLength(io1), so per-chunk
+        // binds need no offset math); chunks are row-aligned pow2.
         let _ = words;
-        let bg = self
-            .kctx
-            .bind(&self.dev, &self.ps, &m.chunks[0], &self.dummy);
-        let threads = m.len_words / 16; // perm_batch: 16 words/thread
-        pipeline::dispatch(&self.dev, pipe, &bg, threads.max(1));
+        for (ci, c) in m.chunks.iter().enumerate() {
+            let take = m.chunk_len(ci);
+            if take == 0 {
+                break;
+            }
+            let bg = self.kctx.bind(&self.dev, &self.ps, c, &self.dummy);
+            let threads = take / 16; // perm_batch: 16 words/thread
+            pipeline::dispatch(&self.dev, pipe, &bg, threads.max(1));
+        }
     }
     
     /// FRI commit 8-col layer (Layer 0): hash each 8-col row
@@ -144,41 +150,62 @@ impl Poseidon2ChipShim for WgpuBackend {
 }
 
 impl MerkleHasherShim for WgpuBackend {
-    /// GPU legs: derive_row -> merkle_init -> 12x merkle_compress (all on the
-    /// WGSL paths copied from wgpu-probe + b1 ported kernels).
+    /// GPU legs: derive_row -> merkle_init -> merkle_compress (WGSL paths
+    /// from wgpu-probe + b1 ported kernels). Phase-2: buffers are ShardBufs
+    /// and every bind is a pow2-aligned window <= device binding cap, so
+    /// the pass runs under WebGPU spec-floor limits unchanged.
     fn merkle_root_from_seed(&self, seed_canon: u32, num_leaves: usize) -> [u32; 8] {
+        use crate::limitsbuf::ShardBuf;
         assert_eq!(seed_canon, (MERKLE_SEED % crate::field::P as u64) as u32);
         let n = num_leaves;
-        self.kctx.set_seed(&self.dev, seed_canon);
-        // rows: n x 8 mont words
-        let rows = WgpuMat::zeros(&self.dev, n, 8);
-        let derive_threads = n;
-        let bg = self
-            .kctx
-            .bind(&self.dev, &self.ps, &rows.chunks[0], &self.dummy);
-        pipeline::dispatch(&self.dev, &self.ps.derive_row, &bg, derive_threads);
-        // leaves = init(rows)
-        let mut cur = WgpuMat::zeros(&self.dev, n, 8);
-        {
-            let bg = self
-                .kctx
-                .bind(&self.dev, &self.ps, &rows.chunks[0], &cur.chunks[0]);
-            pipeline::dispatch(&self.dev, &self.ps.merkle_init, &bg, n);
+        let us = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let dev = &self.dev;
+        // rows: n x 8 mont words (zero-init not needed: derive writes all)
+        let rows = ShardBuf::new(dev, "merkle-rows", us, (n * 8 * 4) as u64);
+        let wr = (dev.win() / 32).min(n as u64).max(1); // rows per derive/init window
+        for w0 in (0..n as u64).step_by(wr as usize) {
+            let cnt = wr.min(n as u64 - w0);
+            self.kctx.set_seed_row(dev, seed_canon, w0 as u32);
+            let bg = self.kctx.bind_res(
+                dev,
+                &self.ps,
+                rows.bind(dev, w0 * 32, cnt * 32),
+                self.dummy.as_entire_binding(),
+            );
+            pipeline::dispatch(dev, &self.ps.derive_row, &bg, cnt as usize);
         }
-        // compress levels
-        while cur.len_words > 8 {
-            let in_nodes = cur.len_words / 8;
-            let out_nodes = in_nodes / 2;
-            let nxt = WgpuMat::zeros(&self.dev, out_nodes, 8);
-            {
-                let bg = self
-                    .kctx
-                    .bind(&self.dev, &self.ps, &cur.chunks[0], &nxt.chunks[0]);
-                pipeline::dispatch(&self.dev, &self.ps.merkle_compress, &bg, out_nodes);
+        // leaves = init(rows)
+        let mut cur = ShardBuf::new(dev, "merkle-leaves", us, (n * 8 * 4) as u64);
+        for w0 in (0..n as u64).step_by(wr as usize) {
+            let cnt = wr.min(n as u64 - w0);
+            let bg = self.kctx.bind_res(
+                dev,
+                &self.ps,
+                rows.bind(dev, w0 * 32, cnt * 32),
+                cur.bind(dev, w0 * 32, cnt * 32),
+            );
+            pipeline::dispatch(dev, &self.ps.merkle_init, &bg, cnt as usize);
+        }
+        // compress levels: window of out-rows W: read 2W rows => W <= win/64
+        let mut cur_n = n;
+        while cur_n > 1 {
+            let out_nodes = cur_n / 2;
+            let nxt = ShardBuf::new(dev, "merkle-nxt", us, (out_nodes * 8 * 4) as u64);
+            let wo = (dev.win() / 64).min(out_nodes as u64).max(1);
+            for w0 in (0..out_nodes as u64).step_by(wo as usize) {
+                let cnt = wo.min(out_nodes as u64 - w0);
+                let bg = self.kctx.bind_res(
+                    dev,
+                    &self.ps,
+                    cur.bind(dev, w0 * 64, cnt * 64),
+                    nxt.bind(dev, w0 * 32, cnt * 32),
+                );
+                pipeline::dispatch(dev, &self.ps.merkle_compress, &bg, cnt as usize);
             }
             cur = nxt;
+            cur_n = out_nodes;
         }
-        let root_mont = cur.copy_out(&self.dev);
+        let root_mont = cur.read_words(dev, 0, 8);
         let mut root = [0u32; 8];
         for i in 0..8 {
             root[i] = decode(root_mont[i]);

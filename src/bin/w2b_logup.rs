@@ -87,10 +87,6 @@ fn quads_bytes(groups: &[&[u32]]) -> Vec<u8> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--list-adapters") {
-        wgpu_backend::adapters::list_adapters();
-        std::process::exit(0);
-    }
     let mut inputs_dir = PathBuf::from(".");
     let mut traces_dir = PathBuf::from(".");
     let mut snap_dir: Option<PathBuf> = None;
@@ -129,7 +125,11 @@ fn main() {
     let inst = &inputs.instances[0];
     let snap_dir = snap_dir.unwrap_or(inputs_dir.clone());
 
-    let arc_mode = args.iter().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
+    let arc_mode = std::env::args().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
+    if std::env::args().any(|a| a == "--list-adapters") {
+        wgpu_backend::adapters::list_adapters();
+        std::process::exit(0);
+    }
     let dev = WgpuDevice::init(InitOpts { require_intel_arc: arc_mode, allow_u32_only: !arc_mode, device_substring: wgpu_backend::adapters::device_substring_from_env() });
     let pipe = GkrPipeline::new(&dev);
     let lp = LeafPipeline::new(&dev);
@@ -148,7 +148,8 @@ fn main() {
     for run in 1..=runs {
         let t0 = std::time::Instant::now();
         let (leaf_bufs, leaf_sha) =
-            build_leaf(&dev, &lp, &world, &inputs_dir, &traces_dir, &mut cache, 1 << 29);
+            build_leaf(&dev, &lp, &world, &inputs_dir, &traces_dir, &mut cache,
+                wgpu_backend::gkr::leaf_chunks(&dev, world.log_stack).1);
         eprintln!("run {run}: leaf built sha={} ({:.1}s)", leaf_sha, t0.elapsed().as_secs_f64());
         if leaf_sha != shas.leaf_sha256 {
             eprintln!("LEAF SHA MISMATCH gpu={} expected={}", leaf_sha, shas.leaf_sha256);

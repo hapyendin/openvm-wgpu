@@ -165,8 +165,10 @@ fn perm_batch(@builtin(global_invocation_id) gid: vec3<u32>) {
 // in-kernel; output = 8 mont words per row written to io1)
 @compute @workgroup_size(32u)
 fn derive_row(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x;
-  if (i * 8u >= arrayLength(&io1)) { return; }
+  // uni.a1 = row base of the bound io1 window (0 for whole-buffer binds);
+  // content index is global, the length guard is window-local.
+  let i = gid.x + uni.a1;
+  if (gid.x * 8u >= arrayLength(&io1)) { return; }
   var cells: array<u32, 16u>;
   for (var z: u32 = 0u; z < 16u; z = z + 1u) { cells[z] = 0u; }
   cells[0u] = encw(i);
@@ -287,10 +289,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   workgroupBarrier();
   // CAS first-wins (grind pattern): exactly one thread must consume
   // magic 0xDEADBEEFCAFE1234 built from u32 halves: a >2^63 u64 literal is
-  // rejected by naga (and not universal-WGSL); halves are legal everywhere.
+  // rejected by naga; the halves compose exactly.
   let magic: u64 = (u64(0xDEADBEEFu) << 32u) | u64(0xCAFE1234u);
   let r = atomicCompareExchangeWeak(&at.v, u64(0), magic + u64(i));
-  if (r.exchanged) {
+  if (r.consumed) {
     atomicAdd(&at.c, 1u);
   }
   // u64 atomicAdd (sumcheck raw-sum pattern): 32 x 7
@@ -338,10 +340,10 @@ fn br12(xin: u32) -> u32 {
 
 var<workgroup> data: array<u32, 4096u>;
 
-@compute @workgroup_size(512u)
+@compute @workgroup_size(256u)
 fn ntt_4096_fwd(@builtin(local_invocation_id) lid: vec3<u32>) {
   let tid = lid.x;
-  for (var k: u32 = tid; k < 4096u; k = k + 512u) {
+  for (var k: u32 = tid; k < 4096u; k = k + 256u) {
     data[br12(k)] = nin[k];
   }
   workgroupBarrier();
@@ -349,7 +351,7 @@ fn ntt_4096_fwd(@builtin(local_invocation_id) lid: vec3<u32>) {
   for (var s: u32 = 1u; s <= 12u; s = s + 1u) {
     let half = 1u << s;
     let q1 = half >> 1u;
-    for (var i: u32 = tid; i < 2048u; i = i + 512u) {
+    for (var i: u32 = tid; i < 2048u; i = i + 256u) {
       let b = i & (q1 - 1u);
       let blk = i >> (s - 1u);
       let pp = blk * half + b;
@@ -363,15 +365,15 @@ fn ntt_4096_fwd(@builtin(local_invocation_id) lid: vec3<u32>) {
     off = off + (1u << (s - 1u));
     workgroupBarrier();
   }
-  for (var k2: u32 = tid; k2 < 4096u; k2 = k2 + 512u) {
+  for (var k2: u32 = tid; k2 < 4096u; k2 = k2 + 256u) {
     st[k2] = data[k2];
   }
 }
 
-@compute @workgroup_size(512u)
+@compute @workgroup_size(256u)
 fn ntt_4096_inv(@builtin(local_invocation_id) lid: vec3<u32>) {
   let tid = lid.x;
-  for (var k: u32 = tid; k < 4096u; k = k + 512u) {
+  for (var k: u32 = tid; k < 4096u; k = k + 256u) {
     data[br12(k)] = nin[k];
   }
   workgroupBarrier();
@@ -379,7 +381,7 @@ fn ntt_4096_inv(@builtin(local_invocation_id) lid: vec3<u32>) {
   for (var s: u32 = 1u; s <= 12u; s = s + 1u) {
     let half = 1u << s;
     let q1 = half >> 1u;
-    for (var i: u32 = tid; i < 2048u; i = i + 512u) {
+    for (var i: u32 = tid; i < 2048u; i = i + 256u) {
       let b = i & (q1 - 1u);
       let blk = i >> (s - 1u);
       let pp = blk * half + b;
@@ -394,7 +396,7 @@ fn ntt_4096_inv(@builtin(local_invocation_id) lid: vec3<u32>) {
     workgroupBarrier();
   }
   let inv4096 = 1509949441u;
-  for (var k2: u32 = tid; k2 < 4096u; k2 = k2 + 512u) {
+  for (var k2: u32 = tid; k2 < 4096u; k2 = k2 + 256u) {
     st[k2] = mul(data[k2], inv4096);
   }
 }

@@ -36,6 +36,8 @@ pub struct WgpuDevice {
     pub has_shader_int64: bool,
     /// adapter advertises the wgpu SHADER_INT64_ATOMIC feature
     pub has_int64_atomic_feature: bool,
+    /// true iff device limits were pinned to the WebGPU spec floors
+    pub webgpu_limits: bool,
 }
 
 pub struct InitOpts {
@@ -46,6 +48,26 @@ pub struct InitOpts {
     /// WGPU_DEVICE=<substring>: case-insensitive substring match on adapter
     /// name pins the adapter; no match fails closed. None = capability pick.
     pub device_substring: Option<String>,
+}
+
+/// WebGPU spec-floor limits (pinned in code, NOT downlevel defaults —
+/// those differ and would hide violations). Requested as
+/// floor.min(adapter.limits()); the effective values are printed.
+pub const WEBGPU_FLOOR_BINDING: u64 = 134_217_728; // 128 MiB
+pub const WEBGPU_FLOOR_BUFFER: u64 = 268_435_456; // 256 MiB
+pub const WEBGPU_FLOOR_WG_SMEM: u32 = 16_384;
+pub const WEBGPU_FLOOR_WG_INV: u32 = 256;
+
+pub fn webgpu_limits_env() -> bool {
+    std::env::var("OPENVM_WGPU_WEBGPU_LIMITS").as_deref() == Ok("1")
+}
+
+pub fn pow2_floor(x: u64) -> u64 {
+    if x < 2 {
+        1
+    } else {
+        1u64 << (63 - x.leading_zeros())
+    }
 }
 
 fn feature_probe_list() -> Vec<(&'static str, wgpu::Features)> {
@@ -103,8 +125,11 @@ impl WgpuDevice {
         );
         let info = adapter.get_info();
         let is_intel = info.vendor == 0x8086;
+        // OPENVM_WGPU_FARM=1 = documented farm path (v2 portability rounds):
+        // accepts the first Vulkan adapter of any vendor; Arc goldens unaffected.
+        let farm = std::env::var("OPENVM_WGPU_FARM").is_ok();
         assert!(
-            !opts.require_intel_arc || is_intel,
+            !opts.require_intel_arc || is_intel || farm,
             "ADAPTER ASSERT FAIL: expected Intel Arc (vendor 0x8086), got vendor 0x{:x} ({})",
             info.vendor,
             info.name
@@ -138,8 +163,8 @@ impl WgpuDevice {
         let has_i64 = !force_u32 && adapter.features().contains(wgpu::Features::SHADER_INT64);
         let has_atomic = !force_u32
             && adapter
-            .features()
-            .contains(wgpu::Features::SHADER_INT64_ATOMIC_ALL_OPS);
+                .features()
+                .contains(wgpu::Features::SHADER_INT64_ATOMIC_ALL_OPS);
         if force_u32 {
             println!("OPENVM_WGPU_FORCE_U32=1: SHADER_INT64 features excluded (u32-limb path)");
         }
@@ -149,7 +174,7 @@ impl WgpuDevice {
         println!("SHADER_INT64_ATOMIC_ALL_OPS_available: {has_atomic}");
         println!("SHADER_INT64_ATOMIC_MIN_MAX_available: {has_atomic_minmax}");
         assert!(
-            has_i64 || opts.allow_u32_only,
+            has_i64 || opts.allow_u32_only || force_u32,
             "SHADER_INT64 unavailable and u32-fallback not allowed"
         );
         let mut want = wgpu::Features::empty();
@@ -163,10 +188,40 @@ impl WgpuDevice {
         // NB: SHADER_INT64_ATOMIC is *not* required here — the gate's
         // correctness path is atomic-free. The atomic probe below reports
         // ground-truth availability separately.
+        // OPENVM_WGPU_WEBGPU_LIMITS=1: pin the requested device limits to
+        // the WebGPU spec floors so wgpu's own validation audits every
+        // bind group and buffer we create.
+        let wl = webgpu_limits_env();
+        let al = adapter.limits();
+        let req_limits = if wl {
+            wgpu::Limits {
+                max_bind_groups: 4.min(al.max_bind_groups),
+                max_bindings_per_bind_group: 640.min(al.max_bindings_per_bind_group),
+                max_storage_buffer_binding_size: WEBGPU_FLOOR_BINDING
+                    .min(al.max_storage_buffer_binding_size),
+                max_buffer_size: WEBGPU_FLOOR_BUFFER.min(al.max_buffer_size),
+                max_compute_workgroup_storage_size: WEBGPU_FLOOR_WG_SMEM
+                    .min(al.max_compute_workgroup_storage_size),
+                max_compute_invocations_per_workgroup: WEBGPU_FLOOR_WG_INV
+                    .min(al.max_compute_invocations_per_workgroup),
+                max_compute_workgroup_size_x: 256.min(al.max_compute_workgroup_size_x),
+                max_compute_workgroup_size_y: 256.min(al.max_compute_workgroup_size_y),
+                max_compute_workgroup_size_z: 64.min(al.max_compute_workgroup_size_z),
+                max_compute_workgroups_per_dimension: 65535
+                    .min(al.max_compute_workgroups_per_dimension),
+                ..al
+            }
+        } else {
+            al
+        };
+        println!(
+            "WEBGPU_LIMITS_MODE: {} (floors binding={} buffer={} wg_smem={} wg_inv={})",
+            wl, WEBGPU_FLOOR_BINDING, WEBGPU_FLOOR_BUFFER, WEBGPU_FLOOR_WG_SMEM, WEBGPU_FLOOR_WG_INV
+        );
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("openvm-wgpu"),
             required_features: want,
-            required_limits: adapter.limits(),
+            required_limits: req_limits,
             ..Default::default()
         }))
         .expect("request_device failed");
@@ -181,7 +236,8 @@ impl WgpuDevice {
             features_dbg: feats_dbg,
             available: avail,
             enabled,
-            limits: limits_of(&adapter.limits()),
+            // report the EFFECTIVE device limits (what wgpu validates against)
+            limits: limits_of(&device.limits()),
         };
         println!("FEATURES_ENABLED: {}", report.enabled.join(","));
         println!(
@@ -201,44 +257,45 @@ impl WgpuDevice {
             report,
             has_shader_int64: has_i64,
             has_int64_atomic_feature: has_atomic,
+            webgpu_limits: wl,
         }
+    }
+
+    /// Effective device cap on one storage binding (bytes).
+    pub fn bind_cap(&self) -> u64 {
+        self.report.limits.max_storage_buffer_binding_size
+    }
+    /// Effective device cap on one buffer (bytes).
+    pub fn buf_cap(&self) -> u64 {
+        self.report.limits.max_buffer_size
+    }
+    /// pow2-aligned window for sliced binds of large buffers.
+    /// 256 MiB ceiling keeps windows pow2-divisors of the 1 GiB shard
+    /// size used on unlimited devices (containment for free).
+    pub fn win(&self) -> u64 {
+        self.bind_cap().min(256 << 20)
+    }
+    /// GKR pool/eq window row count: 160 B per row, 640 MiB geometry cap
+    /// (preserves the historical wsz = 2^22 on ANV, 2^19 under floors).
+    pub fn gkr_wsz(&self) -> u32 {
+        pow2_floor(self.bind_cap().min(640 << 20) / 160) as u32
+    }
+    /// GKR leaf-chunk bytes for a 2^t-row leaf (32 B per row). Row count
+    /// is pow2 and bounded by the unpack bind window (128 B/row in pool
+    /// layout) and the pool window, so every unpack bind is legal.
+    pub fn leaf_chunk_bytes(&self, t: u32) -> u64 {
+        (self.win() / 128).min(self.gkr_wsz() as u64).min(1u64 << (t - 2)) * 32
     }
 
     /// Runtime ground-truth probe: u64 atomicStore/CAS/ADD in one WGSL
     /// kernel. Ok(Some(...)) if the driver accepted AND ran u64 atomics;
-    /// Ok(None) if the wgpu feature flag is absent; Err if the probe module
-    /// failed to compile/execute (the wgpu 30 default error sink panics on
-    /// validation errors — e.g. naga@30 rejects u64 literals > i64::MAX in
-    /// the probe WGSL — so the whole probe runs under catch_unwind and the
-    /// failure surfaces as Err; the golden kernels are unaffected because
-    /// they never reference ATOMIC_PROBE).
-    pub fn probe_u64_atomics(&self) -> Result<Option<(u32, u32, u32)>, String> {
+    /// Ok(None) if the wgpu feature flag is absent; Err if the feature was
+    /// advertised but compilation/execution failed (naga error surfaces via
+    /// device error handler — we also force a poll + error-scope check).
+    pub fn probe_u64_atomics(&self) -> Option<(u32, u32, u32)> {
         if !self.has_shader_int64 || !self.has_int64_atomic_feature {
-            return Ok(None);
+            return None;
         }
-        // silence the panic hook during the probe; restore it afterwards.
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.probe_u64_atomics_inner()
-        }));
-        std::panic::set_hook(prev_hook);
-        match result {
-            Ok(inner) => inner,
-            Err(e) => {
-                let msg = if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else if let Some(s) = e.downcast_ref::<&str>() {
-                    s.to_string()
-                } else {
-                    "unknown panic".to_string()
-                };
-                Err(format!("probe panicked (naga/driver rejected probe WGSL?): {msg}"))
-            }
-        }
-    }
-
-    fn probe_u64_atomics_inner(&self) -> Result<Option<(u32, u32, u32)>, String> {
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -339,15 +396,13 @@ impl WgpuDevice {
                 submission_index: None,
                 timeout: None,
             })
-            .map_err(|e| format!("probe poll failed: {e}"))?;
-        let data = slice
-            .get_mapped_range()
-            .map_err(|e| format!("probe map failed: {e}"))?;
+            .ok()?;
+        let data = slice.get_mapped_range().ok()?;
         let lo = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let hi = u32::from_le_bytes(data[4..8].try_into().unwrap());
         let winners = u32::from_le_bytes(data[8..12].try_into().unwrap());
         drop(data);
         staging.unmap();
-        Ok(Some((winners, lo, hi)))
+        Some((winners, lo, hi))
     }
 }

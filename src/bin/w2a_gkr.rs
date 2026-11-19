@@ -43,10 +43,6 @@ struct Report {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--list-adapters") {
-        wgpu_backend::adapters::list_adapters();
-        std::process::exit(0);
-    }
     let mut inputs_dir: PathBuf = PathBuf::from(".");
     let mut json_path: PathBuf = PathBuf::from("gkr-inputs.json");
     let mut runs: u32 = 5;
@@ -80,12 +76,12 @@ fn main() {
     let inputs: GkrInputs = serde_json::from_str(&text).expect("parse gkr-inputs.json");
 
     // WGPU_DEVICE pin (W1 adapter pattern); default = first Intel Arc.
-    let arc_mode = args.iter().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
-    let dev = WgpuDevice::init(InitOpts {
-        require_intel_arc: arc_mode,
-        allow_u32_only: !arc_mode,
-        device_substring: wgpu_backend::adapters::device_substring_from_env(),
-    });
+    let arc_mode = std::env::args().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
+    if std::env::args().any(|a| a == "--list-adapters") {
+        wgpu_backend::adapters::list_adapters();
+        std::process::exit(0);
+    }
+    let dev = WgpuDevice::init(InitOpts { require_intel_arc: arc_mode, allow_u32_only: !arc_mode, device_substring: wgpu_backend::adapters::device_substring_from_env() });
     let pipe = GkrPipeline::new(&dev);
     eprintln!("PIPELINES_READY tree unpack seval fold");
 

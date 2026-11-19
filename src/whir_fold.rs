@@ -2,7 +2,8 @@
 //! merkle (init4 / strided-pair / adjacent-pair layers), Poseidon2 kernels
 //! copied VERBATIM from the golden wgsl.rs perm path.
 use crate::device::WgpuDevice;
-use crate::field::{constants_buffer_mont, u32s_to_bytes};
+use crate::field::{constants_buffer_mont, decode, u32s_to_bytes};
+use crate::limitsbuf::ShardBuf;
 
 const WGSL: &str = r#"
 // `mul` supplied by wgsl::mul_prelude (u64-REDC or pure-u32 limb path)
@@ -10,9 +11,10 @@ const WGSL: &str = r#"
 @group(0) @binding(0) var<storage, read> kc: array<u32>;
 @group(0) @binding(1) var<storage, read_write> io1: array<u32>;
 @group(0) @binding(2) var<storage, read_write> io2: array<u32>;
-struct Uni { a: u32, b: u32, c: u32, d: u32 };
+struct Uni { a: u32, b: u32, c: u32, d: u32, e: u32 };
 @group(0) @binding(3) var<uniform> uni: Uni;
 @group(0) @binding(4) var<storage, read> tw: array<u32>;
+@group(0) @binding(5) var<storage, read_write> io3: array<u32>;
 
 const PP: u32 = 2013265921u;
 const HALF_P1_C: u32 = 1006632961u;
@@ -108,29 +110,54 @@ fn perm_mix(cells: ptr<function, array<u32, 16u>>) {
 }
 
 // one butterfly pair (EF row-major layout: rows of 4 limbs)
-// uni.a = n/2 butterflies, uni.b = half (stage), uni.c = mode (0=fft*tw, 1=mobius)
+// uni.a = n/2 butterflies, uni.b = half (stage), uni.d = butterfly base
+// uni.c = mode: 0=fft*tw local, 1=mobius local, 2=fft*tw FAR (A=io1, B=io2
+// windows of one block pair), 3=mobius FAR. uni.e = window base ROW for
+// the local modes (sliced binds of >128MiB data buffers); pairs are
+// block-aligned and windows are pow2-aligned multiples of 2*half, so
+// j - e*4 is exact window-local addressing with identical arithmetic.
 @compute @workgroup_size(256u)
 fn whir_stage(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let b = gid.x;
-  if (b >= uni.a) { return; }
   let half = uni.b;
-  let block = b / half;
-  let k = b % half;
-  let j = (block * half * 2u + k) * 4u;
-  let jp = j + half * 4u;
-  if (uni.c == 0u) {
-    let w = tw[k];
-    for (var l: u32 = 0u; l < 4u; l = l + 1u) {
-      let u = io1[j + l];
-      let t = mul(io1[jp + l], w);
-      io1[j + l] = addm(u, t);
-      io1[jp + l] = subm(u, t);
+  if (uni.c < 2u) {
+    let b = gid.x + uni.d;
+    if (b >= uni.a) { return; }
+    let block = b / half;
+    let k = b % half;
+    let j = (block * half * 2u + k - uni.e) * 4u;
+    let jp = j + half * 4u;
+    if (uni.c == 0u) {
+      let w = tw[k];
+      for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+        let u = io1[j + l];
+        let t = mul(io1[jp + l], w);
+        io1[j + l] = addm(u, t);
+        io1[jp + l] = subm(u, t);
+      }
+    } else {
+      for (var l2: u32 = 0u; l2 < 4u; l2 = l2 + 1u) {
+        let lo = io1[j + l2];
+        let hi = io1[jp + l2];
+        io1[jp + l2] = subm(hi, lo);
+      }
     }
   } else {
-    for (var l2: u32 = 0u; l2 < 4u; l2 = l2 + 1u) {
-      let lo = io1[j + l2];
-      let hi = io1[jp + l2];
-      io1[jp + l2] = subm(hi, lo);
+    // FAR: one block pair per dispatch; uni.e = block-start row
+    let k = gid.x + uni.d;
+    if (k >= half) { return; }
+    let j = k * 4u;
+    if (uni.c == 2u) {
+      let w = tw[k];
+      for (var l: u32 = 0u; l < 4u; l = l + 1u) {
+        let u = io1[j + l];
+        let t = mul(io2[j + l], w);
+        io1[j + l] = addm(u, t);
+        io2[j + l] = subm(u, t);
+      }
+    } else {
+      for (var l2: u32 = 0u; l2 < 4u; l2 = l2 + 1u) {
+        io2[j + l2] = subm(io2[j + l2], io1[j + l2]);
+      }
     }
   }
 }
@@ -139,7 +166,8 @@ fn whir_stage(@builtin(global_invocation_id) gid: vec3<u32>) {
 // mirrors CPU merkle_leaf on 4-word rows zero-padded to 8.
 @compute @workgroup_size(256u)
 fn whir_init4(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let i = gid.x + uni.d;
+  // window-local: io1/io2 are bound at the same row base; uni.d unused.
+  let i = gid.x;
   if (i * 8u >= arrayLength(&io2)) { return; }
   var cells: array<u32, 16u>;
   for (var z: u32 = 0u; z < 16u; z = z + 1u) { cells[z] = 0u; }
@@ -148,37 +176,40 @@ fn whir_init4(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var j2: u32 = 0u; j2 < 8u; j2 = j2 + 1u) { io2[i * 8u + j2] = cells[j2]; }
 }
 
-// phase-1 strided pairing: uni.a = nsz, uni.b = qs
+// phase-1 strided pairing (windowed): uni.a = nsz (global bound), uni.d =
+// window output-row base i0 (a multiple of qs with window <= qs rows, so
+// x = i0/qs is CONSTANT over the window). A window (2x*qs rows) is io1,
+// B window ((2x+1)*qs rows) is io2, output (row i0..) is io3; all binds
+// are window-aligned so gid.x is the window-local row offset.
 @compute @workgroup_size(256u)
 fn whir_pair_strided(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x + uni.d;
   if (i >= uni.a) { return; }
-  let qs = uni.b;
-  let x = i / qs;
-  let y = i % qs;
-  let li = (2u * x * qs + y) * 8u;
-  let ri = ((2u * x + 1u) * qs + y) * 8u;
+  let o = gid.x * 8u;
   var cells: array<u32, 16u>;
   for (var j: u32 = 0u; j < 8u; j = j + 1u) {
-    cells[j] = io1[li + j];
-    cells[j + 8u] = io1[ri + j];
+    cells[j] = io1[o + j];
+    cells[j + 8u] = io2[o + j];
   }
   perm_mix(&cells);
-  for (var j2: u32 = 0u; j2 < 8u; j2 = j2 + 1u) { io2[i * 8u + j2] = cells[j2]; }
+  for (var j2: u32 = 0u; j2 < 8u; j2 = j2 + 1u) { io3[o + j2] = cells[j2]; }
 }
 
-// phase-2 adjacent pairing: uni.a = nsz
+// phase-2 adjacent pairing (windowed): uni.a = nsz, uni.d = window base
+// row i0. io1 binds rows [2*i0, 2*i0 + 2*w) (64 B/output row), io2 binds
+// out rows [i0, i0 + w) (32 B/row); gid.x is window-local.
 @compute @workgroup_size(256u)
 fn whir_pair_adj(@builtin(global_invocation_id) gid: vec3<u32>) {
   let i = gid.x + uni.d;
   if (i >= uni.a) { return; }
+  let o = gid.x * 8u;
   var cells: array<u32, 16u>;
   for (var j: u32 = 0u; j < 8u; j = j + 1u) {
-    cells[j] = io1[i * 16u + j];
-    cells[j + 8u] = io1[i * 16u + 8u + j];
+    cells[j] = io1[o * 2u + j];
+    cells[j + 8u] = io1[o * 2u + 8u + j];
   }
   perm_mix(&cells);
-  for (var j2: u32 = 0u; j2 < 8u; j2 = j2 + 1u) { io2[i * 8u + j2] = cells[j2]; }
+  for (var j2: u32 = 0u; j2 < 8u; j2 = j2 + 1u) { io2[o + j2] = cells[j2]; }
 }
 "#;
 
@@ -239,7 +270,7 @@ impl WhirFold {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(16),
+                        min_binding_size: wgpu::BufferSize::new(20),
                     },
                     count: None,
                 },
@@ -248,6 +279,16 @@ impl WhirFold {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -331,12 +372,13 @@ impl WhirFold {
     pub fn uni16(&self, dev: &WgpuDevice) -> wgpu::Buffer {
         dev.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uni16"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
     }
 
+    /// whole-buffer bind (small buffers; io3 defaults to a 16 B dummy).
     pub fn bind(
         &self,
         dev: &WgpuDevice,
@@ -345,6 +387,7 @@ impl WhirFold {
         uni: &wgpu::Buffer,
         tw: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
+        let d3 = self.empty16(dev);
         dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.bgl,
@@ -354,16 +397,46 @@ impl WhirFold {
                 wgpu::BindGroupEntry { binding: 2, resource: io2.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: tw.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: d3.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// sliced/windowed bind with caller-provided BindingResources.
+    pub fn bind_res<'a>(
+        &self,
+        dev: &WgpuDevice,
+        io1: wgpu::BindingResource<'a>,
+        io2: wgpu::BindingResource<'a>,
+        io3: wgpu::BindingResource<'a>,
+        uni: &wgpu::Buffer,
+        tw: wgpu::BindingResource<'a>,
+    ) -> wgpu::BindGroup {
+        dev.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.kc_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: io1 },
+                wgpu::BindGroupEntry { binding: 2, resource: io2 },
+                wgpu::BindGroupEntry { binding: 3, resource: uni.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: tw },
+                wgpu::BindGroupEntry { binding: 5, resource: io3 },
             ],
         })
     }
 
     pub fn set_uni(dev: &WgpuDevice, uni: &wgpu::Buffer, a: u32, b: u32, c: u32, d: u32) {
-        let mut x = [0u8; 16];
+        Self::set_uni5(dev, uni, a, b, c, d, 0);
+    }
+
+    pub fn set_uni5(dev: &WgpuDevice, uni: &wgpu::Buffer, a: u32, b: u32, c: u32, d: u32, e: u32) {
+        let mut x = [0u8; 32];
         x[0..4].copy_from_slice(&a.to_le_bytes());
         x[4..8].copy_from_slice(&b.to_le_bytes());
         x[8..12].copy_from_slice(&c.to_le_bytes());
         x[12..16].copy_from_slice(&d.to_le_bytes());
+        x[16..20].copy_from_slice(&e.to_le_bytes());
         dev.queue.write_buffer(uni, 0, &x);
     }
 
@@ -453,4 +526,204 @@ impl WhirFold {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase-2 windowed drivers: all buffers are ShardBufs, every bind is a
+// pow2-aligned window <= device binding cap, so the WHIR stage/merkle path
+// runs unchanged under WebGPU spec-floor limits. Butterfly arithmetic is
+// untouched (window-local addressing), hence bit-identical results.
+// ---------------------------------------------------------------------------
+
+pub const SHARD_USAGES: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::COPY_DST)
+    .union(wgpu::BufferUsages::COPY_SRC);
+
+/// n EF rows x 16 B stage-data buffer.
+pub fn data_shard(dev: &WgpuDevice, n_rows: usize, label: &str) -> ShardBuf {
+    ShardBuf::new(dev, label, SHARD_USAGES, (n_rows * 16) as u64)
+}
+
+/// Run all mobius (mode 1) or DIT-FFT (mode 0, tws[stage] per stage)
+/// butterfly stages in place on `data` (n rows, pow2).
+pub fn whir_stages(
+    dev: &WgpuDevice,
+    wf: &WhirFold,
+    data: &ShardBuf,
+    n: usize,
+    mode: u32,
+    tws: &[wgpu::Buffer],
+) {
+    let uni = wf.uni16(dev);
+    let dummy16 = wf.empty16(dev);
+    let ddummy = wf.dummy_ro(dev);
+    let win_rows = (dev.win() / 16) as usize; // 16 B/row
+    let mut half = 1usize;
+    let mut s = 0usize;
+    while half < n {
+        let twb = if mode == 0 { &tws[s] } else { &ddummy };
+        if 2 * half <= win_rows {
+            // LOCAL: butterflies stay inside one window; blocks are
+            // 2*half-aligned and windows pow2-aligned >= 2*half.
+            let wrows = win_rows.min(n);
+            let mut e0 = 0usize;
+            while e0 < n {
+                let w = wrows.min(n - e0);
+                let blocks = w / (2 * half);
+                let b0 = (e0 / (2 * half)) * half;
+                WhirFold::set_uni5(
+                    dev,
+                    &uni,
+                    (n / 2) as u32,
+                    half as u32,
+                    mode,
+                    b0 as u32,
+                    e0 as u32,
+                );
+                let bg = wf.bind_res(
+                    dev,
+                    data.bind(dev, (e0 * 16) as u64, (w * 16) as u64),
+                    dummy16.as_entire_binding(),
+                    dummy16.as_entire_binding(),
+                    &uni,
+                    twb.as_entire_binding(),
+                );
+                WhirFold::dispatch(dev, &wf.stage, &bg, blocks * half);
+                e0 += w;
+            }
+        } else {
+            // FAR: partner block is outside any sub-128MiB window ->
+            // bind the two block halves of each pair separately.
+            let blocks = n / (2 * half);
+            for bl in 0..blocks {
+                let e0 = bl * 2 * half;
+                WhirFold::set_uni5(
+                    dev,
+                    &uni,
+                    (n / 2) as u32,
+                    half as u32,
+                    mode + 2,
+                    0,
+                    e0 as u32,
+                );
+                let bg = wf.bind_res(
+                    dev,
+                    data.bind(dev, (e0 * 16) as u64, (half * 16) as u64),
+                    data.bind(dev, ((e0 + half) * 16) as u64, (half * 16) as u64),
+                    dummy16.as_entire_binding(),
+                    &uni,
+                    twb.as_entire_binding(),
+                );
+                WhirFold::dispatch(dev, &wf.stage, &bg, half);
+            }
+        }
+        half *= 2;
+        s += 1;
+    }
+}
+
+/// merkle leaf init: rows (n x 8 words) -> cur (n x 8 words), windowed.
+pub fn merkle_init(dev: &WgpuDevice, wf: &WhirFold, rows: &ShardBuf, cur: &ShardBuf, n: usize) {
+    let uni = wf.uni16(dev);
+    let dummy = wf.dummy_ro(dev);
+    let dummy16 = wf.empty16(dev);
+    let wrows = (dev.win() / 32).min(n as u64) as usize;
+    let mut r0 = 0usize;
+    while r0 < n {
+        let w = wrows.min(n - r0);
+        WhirFold::set_uni(dev, &uni, (n * 8) as u32, 0, 0, r0 as u32);
+        let bg = wf.bind_res(
+            dev,
+            rows.bind(dev, (r0 * 32) as u64, (w * 32) as u64),
+            cur.bind(dev, (r0 * 32) as u64, (w * 32) as u64),
+            dummy16.as_entire_binding(),
+            &uni,
+            dummy.as_entire_binding(),
+        );
+        WhirFold::dispatch(dev, &wf.init4, &bg, w);
+        r0 += w;
+    }
+}
+
+/// full merkle tree over initialized cur (n leaves); returns decoded root.
+pub fn merkle_reduce(
+    dev: &WgpuDevice,
+    wf: &WhirFold,
+    cur: &ShardBuf,
+    n: usize,
+    k_whir: usize,
+) -> [u32; 8] {
+    let uni = wf.uni16(dev);
+    let dummy = wf.dummy_ro(dev);
+    let dummy16 = wf.empty16(dev);
+    let qs = n >> k_whir;
+    let mut size = n;
+    let mut nxt = ShardBuf::new(dev, "m nxt", SHARD_USAGES, ((n / 2) * 32) as u64);
+    let mut src = cur;
+    let mut ping = ShardBuf::new(dev, "m ping", SHARD_USAGES, ((n / 2) * 32) as u64);
+    let mut use_nxt = true;
+    // phase-1 strided layers (window <= qs output rows: x = i0/qs const)
+    let wrows_s = (dev.win() / 32).min(qs as u64).max(1) as usize;
+    for _ in 0..k_whir {
+        let nsz = size / 2;
+        let dst: &ShardBuf = if use_nxt { &nxt } else { &ping };
+        let mut i0 = 0usize;
+        while i0 < nsz {
+            let w = wrows_s.min(nsz - i0);
+            let x0 = i0 / qs;
+            WhirFold::set_uni(dev, &uni, nsz as u32, qs as u32, 0, i0 as u32);
+            let bg = wf.bind_res(
+                dev,
+                src.bind(dev, (2 * x0 * qs * 32) as u64, (w * 32) as u64),
+                src.bind(dev, ((2 * x0 + 1) * qs * 32) as u64, (w * 32) as u64),
+                dst.bind(dev, (i0 * 32) as u64, (w * 32) as u64),
+                &uni,
+                dummy.as_entire_binding(),
+            );
+            WhirFold::dispatch(dev, &wf.pair_strided, &bg, w);
+            i0 += w;
+        }
+        src = if use_nxt { &nxt } else { &ping };
+        use_nxt = !use_nxt;
+        size = nsz;
+    }
+    // phase-2 adjacent layers: out window w (64 B in-row) <= win
+    let wrows_a = (dev.win() / 64).max(1) as usize;
+    while size > 1 {
+        let nsz = size / 2;
+        let dst: &ShardBuf = if use_nxt { &nxt } else { &ping };
+        let mut i0 = 0usize;
+        while i0 < nsz {
+            let w = wrows_a.min(nsz - i0);
+            WhirFold::set_uni(dev, &uni, nsz as u32, 0, 0, i0 as u32);
+            let bg = wf.bind_res(
+                dev,
+                src.bind(dev, (i0 * 64) as u64, (w * 64) as u64),
+                dst.bind(dev, (i0 * 32) as u64, (w * 32) as u64),
+                dummy16.as_entire_binding(),
+                &uni,
+                dummy.as_entire_binding(),
+            );
+            WhirFold::dispatch(dev, &wf.pair_adj, &bg, w);
+            i0 += w;
+        }
+        src = if use_nxt { &nxt } else { &ping };
+        use_nxt = !use_nxt;
+        size = nsz;
+    }
+    let root_m = src.read_words(dev, 0, 8);
+    std::array::from_fn(|i| decode(root_m[i]))
+}
+
+/// convenience: rows (n x 8 words) -> full tree -> decoded root.
+pub fn merkle_from_rows(
+    dev: &WgpuDevice,
+    wf: &WhirFold,
+    rows: &ShardBuf,
+    n: usize,
+    k_whir: usize,
+) -> [u32; 8] {
+    let cur = ShardBuf::new(dev, "m cur", SHARD_USAGES, (n * 32) as u64);
+    merkle_init(dev, wf, rows, &cur, n);
+    merkle_reduce(dev, wf, &cur, n, k_whir)
 }

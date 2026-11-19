@@ -5,7 +5,8 @@
 use std::path::{Path, PathBuf};
 use wgpu_backend::device::{InitOpts, WgpuDevice};
 use wgpu_backend::field::{decode, encode, mont_mul, sha256_hex, u32s_to_bytes};
-use wgpu_backend::whir_fold::WhirFold;
+use wgpu_backend::limitsbuf::ShardBuf;
+use wgpu_backend::whir_fold::{self, WhirFold};
 use wgpu_backend::w2c::*;
 
 fn read_u32s(p: &Path) -> Vec<u32> {
@@ -46,20 +47,10 @@ fn powm(mut b: u32, mut e: u64) -> u32 {
 
 fn gpu_mobius(dev: &WgpuDevice, wf: &WhirFold, f: &[Ef]) -> Vec<Ef> {
     let n = f.len();
-    let logn = n.trailing_zeros();
-    let data = wf.buf(dev, &flatten(f), "mob in");
-    let dummy = wf.empty16(dev);
-    let ddummy = wf.dummy_ro(dev);
-    let uni = wf.uni16(dev);
-    let mut half = 1usize;
-    while half < n {
-        let bg = wf.bind(dev, &data, &dummy, &uni, &ddummy);
-        WhirFold::set_uni(dev, &uni, (n / 2) as u32, half as u32, 1u32, 0);
-        WhirFold::dispatch(dev, &wf.stage, &bg, n / 2);
-        half *= 2;
-    }
-    let _ = logn;
-    unflatten(&WhirFold::read_back(dev, &data, n * 4))
+    let data = whir_fold::data_shard(dev, n, "mob in");
+    data.write_slice(dev, 0, &u32s_to_bytes(&flatten(f)));
+    whir_fold::whir_stages(dev, wf, &data, n, 1, &[]);
+    unflatten(&data.read_words(dev, 0, (n * 4) as u64))
 }
 
 fn gpu_fft(dev: &WgpuDevice, wf: &WhirFold, coeffs: &[Ef], log_n: u32) -> Vec<Ef> {
@@ -73,12 +64,11 @@ fn gpu_fft(dev: &WgpuDevice, wf: &WhirFold, coeffs: &[Ef], log_n: u32) -> Vec<Ef
         let j = ((i as u32).reverse_bits() >> (32 - log_n)) as usize;
         perm[j] = rows[i];
     }
-    let data = wf.buf(dev, &flatten(&perm), "fft in");
-    let dummy = wf.empty16(dev);
+    let data = whir_fold::data_shard(dev, n, "fft in");
+    data.write_slice(dev, 0, &u32s_to_bytes(&flatten(&perm)));
     let ddummy = wf.dummy_ro(dev);
-    let uni = wf.uni16(dev);
+    let mut tws: Vec<wgpu::Buffer> = Vec::new();
     let mut half = 1usize;
-    let mut s = 0u32;
     while half < n {
         // twiddle table identical chain to CPU fft_inplace
         let wm = powm(root_of_unity_raw(log_n), (n / (half * 2)) as u64);
@@ -87,15 +77,12 @@ fn gpu_fft(dev: &WgpuDevice, wf: &WhirFold, coeffs: &[Ef], log_n: u32) -> Vec<Ef
         for k in 1..half {
             tw[k] = mont_mul(tw[k - 1], wm);
         }
-        let twb = wf.buf(dev, &tw, "tw");
-        let bg = wf.bind(dev, &data, &dummy, &uni, &twb);
-        WhirFold::set_uni(dev, &uni, (n / 2) as u32, half as u32, 0u32, 0);
-        WhirFold::dispatch(dev, &wf.stage, &bg, n / 2);
+        tws.push(wf.buf(dev, &tw, "tw"));
         half *= 2;
-        s += 1;
     }
-    let _ = s;
-    unflatten(&WhirFold::read_back(dev, &data, n * 4))
+    let _ = &ddummy;
+    whir_fold::whir_stages(dev, wf, &data, n, 0, &tws);
+    unflatten(&data.read_words(dev, 0, (n * 4) as u64))
 }
 
 fn gpu_merkle(dev: &WgpuDevice, wf: &WhirFold, grs: &[Ef], k_whir: usize) -> [u32; 8] {
@@ -106,36 +93,14 @@ fn gpu_merkle(dev: &WgpuDevice, wf: &WhirFold, grs: &[Ef], k_whir: usize) -> [u3
         rows8.extend_from_slice(r);
         rows8.extend_from_slice(&[0u32; 4]);
     }
-    let rows_b = wf.buf(dev, &rows8, "m rows");
-    let mut cur = wf.zeros(dev, n * 8, "m cur");
-    let uni = wf.uni16(dev);
-    let dummy = wf.dummy_ro(dev);
-    {
-        let bg = wf.bind(dev, &rows_b, &cur, &uni, &dummy);
-        WhirFold::dispatch_offset(dev, &wf.init4, &bg, &uni, (n * 8) as u32, 0, 0, n);
-    }
-    drop(rows_b);
-    // phase-1: k_whir strided layers, qs constant
-    let qs = n >> k_whir;
-    let mut size = n;
-    let mut nxt = wf.zeros(dev, (n / 2) * 8, "m nxt");
-    for _ in 0..k_whir {
-        let nsz = size / 2;
-        let bg = wf.bind(dev, &cur, &nxt, &uni, &dummy);
-        WhirFold::dispatch_offset(dev, &wf.pair_strided, &bg, &uni, nsz as u32, qs as u32, 0, nsz);
-        std::mem::swap(&mut cur, &mut nxt);
-        size = nsz;
-    }
-    // phase-2: adjacent pairs to root
-    while size > 1 {
-        let nsz = size / 2;
-        let bg = wf.bind(dev, &cur, &nxt, &uni, &dummy);
-        WhirFold::dispatch_offset(dev, &wf.pair_adj, &bg, &uni, nsz as u32, 0, 0, nsz);
-        std::mem::swap(&mut cur, &mut nxt);
-        size = nsz;
-    }
-    let root_m = WhirFold::read_back(dev, &cur, 8);
-    std::array::from_fn(|i| decode(root_m[i]))
+    let rows_b = ShardBuf::new(
+        dev,
+        "m rows",
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        (n * 32) as u64,
+    );
+    rows_b.write_slice(dev, 0, &u32s_to_bytes(&rows8));
+    whir_fold::merkle_from_rows(dev, wf, &rows_b, n, k_whir)
 }
 
 struct InstPlan {
@@ -153,10 +118,6 @@ struct InstPlan {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--list-adapters") {
-        wgpu_backend::adapters::list_adapters();
-        std::process::exit(0);
-    }
     let mut whir = PathBuf::from("/home/matt/appz/openvm-sycl-skel/b9/r15/w2c-r1/whir");
     let mut gold = PathBuf::from("w2c-results-r1-GREEN.json");
     let mut out = PathBuf::from("w2c-fold-report.json");
@@ -184,7 +145,11 @@ fn main() {
     let goldv: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&gold).unwrap()).unwrap();
 
-    let arc_mode = args.iter().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
+    let arc_mode = std::env::args().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
+    if std::env::args().any(|a| a == "--list-adapters") {
+        wgpu_backend::adapters::list_adapters();
+        std::process::exit(0);
+    }
     let dev = WgpuDevice::init(InitOpts { require_intel_arc: arc_mode, allow_u32_only: !arc_mode, device_substring: wgpu_backend::adapters::device_substring_from_env() });
     println!("ADAPTER {}", dev.report.name);
     let wf = WhirFold::new(&dev);

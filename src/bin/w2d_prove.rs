@@ -11,7 +11,8 @@ use wgpu_backend::field::{constants_buffer_mont, decode, encode, fsub, mont_mul,
 use wgpu_backend::gkr::{check_expected, check_snapshots, run_instance_gpu, GkrInputs, GkrPipeline};
 use wgpu_backend::logup_leaf::{build_leaf, LeafPipeline, LeafWorld, TraceCache};
 use wgpu_backend::w2c::*;
-use wgpu_backend::whir_fold::WhirFold;
+use wgpu_backend::limitsbuf::ShardBuf;
+use wgpu_backend::whir_fold::{self, WhirFold};
 use wgpu_backend::wgsl;
 
 fn read_u32s(p: &Path) -> Vec<u32> {
@@ -97,10 +98,6 @@ fn grind_check(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--list-adapters") {
-        wgpu_backend::adapters::list_adapters();
-        std::process::exit(0);
-    }
     let mut world = PathBuf::from("/home/matt/appz/openvm-sycl-skel/b9/r15/w2d-r1");
     let mut inputs = PathBuf::from("/home/matt/appz/openvm-wgpu/w2d/w2d-inputs");
     let mut streams = PathBuf::from("/home/matt/appz/openvm-wgpu/w2d/streams-w2d");
@@ -254,7 +251,11 @@ fn main() {
     }
 
     // ---------------- GPU init ----------------
-    let arc_mode = args.iter().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
+    let arc_mode = std::env::args().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
+    if std::env::args().any(|a| a == "--list-adapters") {
+        wgpu_backend::adapters::list_adapters();
+        std::process::exit(0);
+    }
     let dev = WgpuDevice::init(InitOpts { require_intel_arc: arc_mode, allow_u32_only: !arc_mode, device_substring: wgpu_backend::adapters::device_substring_from_env() });
     eprintln!("ADAPTER {} vmhwm={}MB", dev.report.name, vm_hwm_mb());
     let pipe = GkrPipeline::new(&dev);
@@ -265,7 +266,8 @@ fn main() {
     let world_lw: LeafWorld = serde_json::from_str(&std::fs::read_to_string(inputs.join("leafworld.json")).unwrap()).unwrap();
     let traces_dir = world.join("traces/app-segments_0");
     let mut cache = TraceCache::new();
-    let (leaf_bufs, leaf_sha) = build_leaf(&dev, &lp, &world_lw, &inputs, &traces_dir, &mut cache, 1 << 29);
+    let (leaf_bufs, leaf_sha) = build_leaf(&dev, &lp, &world_lw, &inputs, &traces_dir, &mut cache,
+        wgpu_backend::gkr::leaf_chunks(&dev, world_lw.log_stack).1);
     let leaf_exp = {
         let j: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(inputs.join("world-info.json")).unwrap()).unwrap();
         j["leaf_sha256_raw_dump"].as_str().unwrap().to_string()
@@ -741,29 +743,16 @@ fn read_back_off(dev: &WgpuDevice, b: &wgpu::Buffer, off_words: u64, nwords: usi
 }
 fn gpu_mobius(dev: &WgpuDevice, wf: &WhirFold, f: &[Ef]) -> Vec<Ef> {
     let n = f.len();
-    let data = wf.buf(dev, &flatten(f), "mob in");
-    let dummy = wf.empty16(dev);
-    let ddummy = wf.dummy_ro(dev);
-    let uni = wf.uni16(dev);
-    let mut half = 1usize;
-    while half < n {
-        let bg = wf.bind(dev, &data, &dummy, &uni, &ddummy);
-        WhirFold::set_uni(dev, &uni, (n / 2) as u32, half as u32, 1u32, 0);
-        WhirFold::dispatch(dev, &wf.stage, &bg, n / 2);
-        half *= 2;
-    }
-    unflatten(&WhirFold::read_back(dev, &data, n * 4))
+    let data = whir_fold::data_shard(dev, n, "mob in");
+    data.write_slice(dev, 0, &u32s_to_bytes(&flatten(f)));
+    whir_fold::whir_stages(dev, wf, &data, n, 1, &[]);
+    unflatten(&data.read_words(dev, 0, (n * 4) as u64))
 }
 fn gpu_fft_merkle_stream(dev: &WgpuDevice, wf: &WhirFold, coeffs: &[Ef], log_n: u32, n: usize, k_whir: usize) -> [u32; 8] {
-    // W2d lowmem: FFT runs entirely on the device buffer; the 256 MiB result
-    // is streamed to the merkle rows buffer in 16 MiB read-back chunks
-    // (pre-patch this path also built perm 256 MiB + bytes 256 MiB +
-    // read-back Vec 256 MiB + Vec<Ef> re-wrap 256 MiB on the host).
-    let data = dev.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("fft-in"), size: (n * 16) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
+    // W2d lowmem + Phase-2 sharding: FFT runs entirely on a sharded device
+    // buffer; the result is streamed to the merkle rows buffer in 16 MiB
+    // read-back chunks (all binds <= device binding cap).
+    let data = whir_fold::data_shard(dev, n, "fft-in");
     const UC: usize = 1 << 18; // upload rows per chunk (4 MiB)
     let mut bv: Vec<u8> = Vec::with_capacity(UC * 16);
     let mut j0 = 0usize;
@@ -779,72 +768,44 @@ fn gpu_fft_merkle_stream(dev: &WgpuDevice, wf: &WhirFold, coeffs: &[Ef], log_n: 
                 bv.extend_from_slice(&[0u8; 16]);
             }
         }
-        dev.queue.write_buffer(&data, (j0 * 16) as u64, &bv);
+        data.write_slice(dev, (j0 * 16) as u64, &bv);
         j0 += cnt;
     }
     drop(bv);
-    let dummy = wf.empty16(dev);
-    let ddummy = wf.dummy_ro(dev);
-    let uni = wf.uni16(dev);
+    let mut tws: Vec<wgpu::Buffer> = Vec::new();
     let mut half = 1usize;
     while half < n {
         let wm = powm(root_of_unity_raw(log_n), (n / (half * 2)) as u64);
         let mut tw = vec![0u32; half];
         tw[0] = encode(1);
         for k in 1..half { tw[k] = mont_mul(tw[k - 1], wm); }
-        let twb = wf.buf(dev, &tw, "tw");
-        let bg = wf.bind(dev, &data, &dummy, &uni, &twb);
-        WhirFold::set_uni(dev, &uni, (n / 2) as u32, half as u32, 0u32, 0);
-        WhirFold::dispatch(dev, &wf.stage, &bg, n / 2);
+        tws.push(wf.buf(dev, &tw, "tw"));
         half *= 2;
     }
+    whir_fold::whir_stages(dev, wf, &data, n, 0, &tws);
+    drop(tws);
     // stream fft result -> merkle rows (16 MiB words -> 32 MiB rows per chunk)
-    let rows_b = dev.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("m rows"), size: (n * 32) as u64,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    let rows_b = ShardBuf::new(
+        dev,
+        "m rows",
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        (n * 32) as u64,
+    );
     const DC: usize = 1 << 20; // rows per download chunk (16 MiB words / 32 MiB rows)
     let mut bv: Vec<u8> = Vec::with_capacity(DC * 32);
     let mut r0 = 0usize;
     while r0 < n {
         let cnt = DC.min(n - r0);
-        let words = read_back_off(dev, &data, (r0 * 4) as u64, cnt * 4);
+        let words = data.read_words(dev, (r0 * 4) as u64, (cnt * 4) as u64);
         bv.clear();
         for row in words.chunks_exact(4) {
             bv.extend_from_slice(&u32s_to_bytes(row));
             bv.extend_from_slice(&[0u8; 16]);
         }
-        dev.queue.write_buffer(&rows_b, (r0 * 32) as u64, &bv);
+        rows_b.write_slice(dev, (r0 * 32) as u64, &bv);
         r0 += cnt;
     }
     drop(data);
     drop(bv);
-    let mut cur = wf.zeros(dev, n * 8, "m cur");
-    let uni = wf.uni16(dev);
-    let dummy = wf.dummy_ro(dev);
-    {
-        let bg = wf.bind(dev, &rows_b, &cur, &uni, &dummy);
-        WhirFold::dispatch_offset(dev, &wf.init4, &bg, &uni, (n * 8) as u32, 0, 0, n);
-    }
-    drop(rows_b);
-    let qs = n >> k_whir;
-    let mut size = n;
-    let mut nxt = wf.zeros(dev, (n / 2) * 8, "m nxt");
-    for _ in 0..k_whir {
-        let nsz = size / 2;
-        let bg = wf.bind(dev, &cur, &nxt, &uni, &dummy);
-        WhirFold::dispatch_offset(dev, &wf.pair_strided, &bg, &uni, nsz as u32, qs as u32, 0, nsz);
-        std::mem::swap(&mut cur, &mut nxt);
-        size = nsz;
-    }
-    while size > 1 {
-        let nsz = size / 2;
-        let bg = wf.bind(dev, &cur, &nxt, &uni, &dummy);
-        WhirFold::dispatch_offset(dev, &wf.pair_adj, &bg, &uni, nsz as u32, 0, 0, nsz);
-        std::mem::swap(&mut cur, &mut nxt);
-        size = nsz;
-    }
-    let root_m = WhirFold::read_back(dev, &cur, 8);
-    std::array::from_fn(|i| decode(root_m[i]))
+    whir_fold::merkle_from_rows(dev, wf, &rows_b, n, k_whir)
 }
