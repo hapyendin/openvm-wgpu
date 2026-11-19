@@ -12,12 +12,24 @@ pub trait MatrixDimensions {
     fn width(&self) -> usize;
 }
 
+/// Threading bound for `ProverBackendShim` types. Native keeps the CUDA-shape
+/// Send+Sync; on wasm the wgpu web backend is Rc-based (single-threaded JS
+/// event loop), so only MatrixDimensions applies there.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MatrixBound: MatrixDimensions + Send + Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: MatrixDimensions + Send + Sync> MatrixBound for T {}
+#[cfg(target_arch = "wasm32")]
+pub trait MatrixBound: MatrixDimensions {}
+#[cfg(target_arch = "wasm32")]
+impl<T: MatrixDimensions> MatrixBound for T {}
+
 /// Mirrors `ProverBackend` (hal.rs:23) — associated-type surface.
 pub trait ProverBackendShim {
     type Val: Copy + Send + Sync;
     type Challenge: Copy + Send + Sync;
     type Commitment: Clone + Send + Sync;
-    type Matrix: MatrixDimensions + Send + Sync;
+    type Matrix: MatrixBound;
     type PcsData: Send + Sync;
 }
 

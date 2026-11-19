@@ -4,6 +4,8 @@
 // SHADER_INT64 preferred, then max_buffer_size, then discrete. require_intel_arc
 // stays as strict-mode (OPENVM_WGPU_ARC=1 / --arc); WGPU_DEVICE=<substring>
 // pins by name. No adapter passes => FAIL CLOSED with the table printed.
+// The W1 path is cfg-gated native-only (pollster enumeration); the wasm tier
+// uses init_async/init_browser with the plain request_adapter path.
 #[derive(Debug, Clone, Copy)]
 pub struct LimitsReport {
     pub max_storage_buffer_binding_size: u64,
@@ -44,8 +46,7 @@ pub struct InitOpts {
     /// require Intel (0x8086) discrete GPU — b70 strict-mode law; false = capability pick
     pub require_intel_arc: bool,
     /// tolerate missing SHADER_INT64 (pure-u32 limb path)
-    pub allow_u32_only: bool,
-    /// WGPU_DEVICE=<substring>: case-insensitive substring match on adapter
+    pub allow_u32_only: bool,    /// WGPU_DEVICE=<substring>: case-insensitive substring match on adapter
     /// name pins the adapter; no match fails closed. None = capability pick.
     pub device_substring: Option<String>,
 }
@@ -94,35 +95,73 @@ fn limits_of(l: &wgpu::Limits) -> LimitsReport {
 }
 
 impl WgpuDevice {
+    /// Native sync entry (pollster-driven). On wasm `init` is unavailable
+    /// (no thread-blocking event-loop pumping in the browser); wasm tiers
+    /// call `init_async` / `init_browser`.
     pub fn init(opts: InitOpts) -> WgpuDevice {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pollster::block_on(WgpuDevice::init_async(opts))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = opts;
+            panic!("WgpuDevice::init is native-only on wasm; use init_async/init_browser")
+        }
+    }
+
+    /// Async core of device init. Native behavior identical to the
+    /// historical sync body (same env knobs, asserts, prints); on wasm the
+    /// env knobs read as unset (browser = spec floors, u32 path).
+    pub async fn init_async(opts: InitOpts) -> WgpuDevice {
+        #[cfg(not(target_arch = "wasm32"))]
         let t0 = std::time::Instant::now();
-        // ---- GATE W1 selection path: enumerate + capability-driven pick ----
-        let enumerated = crate::adapters::enumerate_full();
-        let infos: Vec<crate::adapters::AdapterInfo> =
-            enumerated.iter().map(|e| e.info.clone()).collect();
-        let idx = match crate::adapters::select(
-            &infos,
-            opts.device_substring.as_deref(),
-            opts.require_intel_arc,
-            opts.allow_u32_only,
-        ) {
-            Ok(i) => i,
-            Err(reason) => {
-                crate::adapters::print_table(&infos);
-                panic!("FAIL CLOSED: {reason}");
-            }
+        #[cfg(not(target_arch = "wasm32"))]
+        let adapter = {
+            // GATE W1 selection path: enumerate + capability-driven pick.
+            let enumerated = crate::adapters::enumerate_full();
+            let infos: Vec<crate::adapters::AdapterInfo> =
+                enumerated.iter().map(|e| e.info.clone()).collect();
+            let idx = match crate::adapters::select(
+                &infos,
+                opts.device_substring.as_deref(),
+                opts.require_intel_arc,
+                opts.allow_u32_only,
+            ) {
+                Ok(i) => i,
+                Err(reason) => {
+                    crate::adapters::print_table(&infos);
+                    panic!("FAIL CLOSED: {reason}");
+                }
+            };
+            println!(
+                "SELECTED idx={idx}/{} strategy={} score={:?}",
+                infos.len(),
+                if opts.device_substring.is_some() {
+                    "WGPU_DEVICE substring pin"
+                } else {
+                    "capability (int64, buffer_max, discrete)"
+                },
+                crate::adapters::capability_score(&infos[idx])
+            );
+            enumerated[idx].adapter.clone()
         };
-        let adapter = &enumerated[idx].adapter;
-        println!(
-            "SELECTED idx={idx}/{} strategy={} score={:?}",
-            infos.len(),
-            if opts.device_substring.is_some() {
-                "WGPU_DEVICE substring pin"
-            } else {
-                "capability (int64, buffer_max, discrete)"
-            },
-            crate::adapters::capability_score(&infos[idx])
-        );
+        #[cfg(target_arch = "wasm32")]
+        let adapter = {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                    ..Default::default()
+                })
+                .await
+                .expect("no vulkan adapter")
+        };
         let info = adapter.get_info();
         let is_intel = info.vendor == 0x8086;
         // OPENVM_WGPU_FARM=1 = documented farm path (v2 portability rounds):
@@ -218,13 +257,15 @@ impl WgpuDevice {
             "WEBGPU_LIMITS_MODE: {} (floors binding={} buffer={} wg_smem={} wg_inv={})",
             wl, WEBGPU_FLOOR_BINDING, WEBGPU_FLOOR_BUFFER, WEBGPU_FLOOR_WG_SMEM, WEBGPU_FLOOR_WG_INV
         );
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("openvm-wgpu"),
-            required_features: want,
-            required_limits: req_limits,
-            ..Default::default()
-        }))
-        .expect("request_device failed");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("openvm-wgpu"),
+                required_features: want,
+                required_limits: req_limits,
+                ..Default::default()
+            })
+            .await
+            .expect("request_device failed");
         let enabled: Vec<String> = want.iter().map(|f| f.to_string()).collect();
         let report = AdapterReport {
             name: info.name.clone(),
@@ -250,6 +291,7 @@ impl WgpuDevice {
             report.limits.max_bindings_per_bind_group
         );
         println!("FEATURES_FULL {:?}", report.features_dbg);
+        #[cfg(not(target_arch = "wasm32"))]
         println!("DEVICE_INIT_MS {:.1}", t0.elapsed().as_secs_f64() * 1e3);
         WgpuDevice {
             device,
@@ -258,6 +300,85 @@ impl WgpuDevice {
             has_shader_int64: has_i64,
             has_int64_atomic_feature: has_atomic,
             webgpu_limits: wl,
+        }
+    }
+
+    /// Browser entry: BROWSER_WEBGPU backend, request adapter with
+    /// compatible_surface None, device with NO extra features and
+    /// `Limits::default()` (on wasm that IS the WebGPU spec-floor set —
+    /// the browser is the floor). Adapter vendor is reported, not asserted.
+    pub async fn init_browser() -> WgpuDevice {
+        #[cfg(not(target_arch = "wasm32"))]
+        let t0 = std::time::Instant::now();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+                ..Default::default()
+            })
+            .await
+            .expect("no webgpu adapter (WebGPU unavailable in this browser?)");
+        let info = adapter.get_info();
+        println!(
+            "ADAPTER name={:?} vendor=0x{:x} device=0x{:x} driver={:?} driver_info={:?} type={:?} backend={:?}",
+            info.name, info.vendor, info.device, info.driver, info.driver_info, info.device_type, info.backend
+        );
+        println!(
+            "ADAPTER_IS_INTEL_ARC: {}",
+            info.vendor == 0x8086 || info.name.to_lowercase().contains("arc")
+        );
+        let feats_dbg = format!("{:?}", adapter.features());
+        let avail: Vec<String> = feature_probe_list()
+            .iter()
+            .filter(|(_, f)| adapter.features().contains(*f))
+            .map(|(n, _)| n.to_string())
+            .collect();
+        let avail_s = if avail.is_empty() { "-".to_string() } else { avail.join(",") };
+        println!("FEATURES_AVAILABLE: {avail_s}");
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("openvm-wasm"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            })
+            .await
+            .expect("request_device failed");
+        let report = AdapterReport {
+            name: info.name.clone(),
+            vendor_id: info.vendor,
+            device_id: info.device,
+            driver: info.driver.clone(),
+            driver_info: info.driver_info.clone(),
+            device_type: format!("{:?}", info.device_type),
+            features_dbg: feats_dbg,
+            available: avail,
+            enabled: Vec::new(),
+            limits: limits_of(&device.limits()),
+        };
+        println!(
+            "LIMITS storage_binding_max={} buffer_max={} wg_smem={} wg_inv={} wg_per_dim={} bindings_per_bg={}",
+            report.limits.max_storage_buffer_binding_size,
+            report.limits.max_buffer_size,
+            report.limits.max_compute_workgroup_storage_size,
+            report.limits.max_compute_invocations_per_workgroup,
+            report.limits.max_compute_workgroups_per_dimension,
+            report.limits.max_bindings_per_bind_group
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        println!("DEVICE_INIT_MS {:.1}", t0.elapsed().as_secs_f64() * 1e3);
+        WgpuDevice {
+            device,
+            queue,
+            report,
+            has_shader_int64: false,
+            has_int64_atomic_feature: false,
+            webgpu_limits: true,
         }
     }
 
