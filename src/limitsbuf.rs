@@ -213,4 +213,69 @@ impl ShardBuf {
     pub fn read_all(&self, dev: &WgpuDevice) -> Vec<u32> {
         self.read_words(dev, 0, self.size / 4)
     }
+
+    /// W2A-BROWSER: awaitable twin of read_words. Native branch identical to
+    /// the sync body (map_async + poll(Wait)); wasm32 awaits the mapAsync
+    /// callback via a oneshot (device.poll is a NO-OP on the WebGPU backend).
+    pub async fn read_words_async(
+        &self,
+        dev: &WgpuDevice,
+        word_off: u64,
+        nwords: u64,
+    ) -> Vec<u32> {
+        let mut out = vec![0u32; nwords as usize];
+        let mut done = 0u64;
+        while done < nwords {
+            let o = (word_off + done) * 4;
+            let (i, so) = self.loc(o);
+            let take = (nwords - done).min((self.shards[i].size() - so) / 4);
+            if take == 0 {
+                break;
+            }
+            let staging = dev.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shard-read"),
+                size: take * 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut enc = dev
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            enc.copy_buffer_to_buffer(&self.shards[i], so, &staging, 0, take * 4);
+            dev.queue.submit(Some(enc.finish()));
+            let slice = staging.slice(..);
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                slice.map_async(wgpu::MapMode::Read, |_| ());
+                dev.device
+                    .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+                    .expect("shard read poll");
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let (tx, rx) =
+                    futures::channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+                rx.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string()))
+                    .expect("shard read map");
+            }
+            {
+                let data = slice.get_mapped_range().expect("map");
+                for k in 0..take as usize {
+                    out[(done + k as u64) as usize] =
+                        u32::from_le_bytes(data[4 * k..4 * k + 4].try_into().unwrap());
+                }
+            }
+            staging.unmap();
+            done += take;
+        }
+        assert_eq!(done, nwords, "read_words_async stalled");
+        out
+    }
+
+    pub async fn read_all_async(&self, dev: &WgpuDevice) -> Vec<u32> {
+        self.read_words_async(dev, 0, self.size / 4).await
+    }
 }

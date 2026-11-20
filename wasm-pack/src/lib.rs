@@ -12,6 +12,7 @@ use wasm_bindgen::prelude::*;
 mod atlas;
 mod gatefast;
 mod grind;
+mod w2a;
 
 use wgpu_backend::device::WgpuDevice;
 use crate::atlas::ReadBatch;

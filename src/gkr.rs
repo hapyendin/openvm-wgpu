@@ -395,12 +395,80 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
+#[allow(dead_code)]
 fn download(dev: &WgpuDevice, buf: &wgpu::Buffer) -> Vec<u8> {
     download_n(dev, buf, buf.size())
 }
 
+// ---------------- async readback port (W2A in-browser) ----------------
+//
+// W2A-BROWSER: on wasm32 `device.poll(PollType::Wait)` is a NO-OP in the
+// WebGPU backend (returns Ok(QueueEmpty), map resolves from the JS
+// mapAsync promise), so the sync poll-loop readbacks below silently return
+// empty in the browser. The *_async variants keep the NATIVE branch exactly
+// as the sync code (same map_async + poll(Wait) + get_mapped_range tail,
+// same call order) and only swap the wait for a oneshot await of the
+// mapAsync callback on wasm32 (the wasm-pack oneshot pattern). The driver
+// (`run_instance_async` / `run_instance_gpu_async`) awaits these; the native
+// sync API is preserved via pollster::block_on wrappers at the bottom.
+
+/// Copy `n` bytes of `buf` starting at `off` to the host (awaitable).
+pub async fn download_off_async(
+    dev: &WgpuDevice,
+    buf: &wgpu::Buffer,
+    off: u64,
+    n: u64,
+) -> Vec<u8> {
+    let staging = dev.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gkr-stage-off"),
+        size: n,
+        usage: BU::COPY_DST | BU::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut enc = dev.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: None,
+    });
+    enc.copy_buffer_to_buffer(buf, off, &staging, 0, n);
+    dev.queue.submit(Some(enc.finish()));
+    let slice = staging.slice(..);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        slice.map_async(wgpu::MapMode::Read, |_| ());
+        dev.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .ok();
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let (tx, rx) = futures::channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        // Native never lands here; on wasm the callback fires from the JS
+        // mapAsync promise. A dropped channel / map error yields empty data
+        // exactly like the native `.ok()`/`unwrap_or_default()` posture.
+        let _ = rx.await;
+    }
+    let data: Vec<u8> = slice
+        .get_mapped_range()
+        .map(|d| d.to_vec())
+        .unwrap_or_default();
+    drop(slice);
+    staging.unmap();
+    data
+}
+
+/// Copy the first `n` bytes of `buf` to the host (awaitable).
+pub async fn download_n_async(dev: &WgpuDevice, buf: &wgpu::Buffer, n: u64) -> Vec<u8> {
+    download_off_async(dev, buf, 0, n).await
+}
+
 /// Copy the first `n` bytes of `buf` to the host.
 /// Copy `n` bytes of `buf` starting at byte offset `off` to the host.
+#[allow(dead_code)]
 fn download_off(dev: &WgpuDevice, buf: &wgpu::Buffer, off: u64, n: u64) -> Vec<u8> {
     let staging = dev.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gkr-stage-off"),
@@ -430,6 +498,7 @@ fn download_off(dev: &WgpuDevice, buf: &wgpu::Buffer, off: u64, n: u64) -> Vec<u
     data
 }
 
+#[allow(dead_code)]
 fn download_n(dev: &WgpuDevice, buf: &wgpu::Buffer, n: u64) -> Vec<u8> {
     let staging = dev.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gkr-stage"),
@@ -483,7 +552,25 @@ pub fn leaf_chunks(dev: &WgpuDevice, t: u32) -> (u32, u64) {
 
 /// Run one full GKR instance on the GPU; returns canonical outputs.
 /// All buffers are dropped on return (memory law: free between runs).
+/// Native sync API (unchanged signature): pollster wrapper over the async
+/// core. On native the async core never yields (the readback cfg branch is
+/// the same poll(Wait) tail), so behavior is identical to the historical
+/// sync body.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn run_instance(
+    dev: &WgpuDevice,
+    pipe: &GkrPipeline,
+    inst: &GkrInstance,
+    leaf_bytes: &[u8],
+    inputs_dir: &Path,
+    snap_shas: &mut Vec<LevelSnap>,
+) -> GkrOutputs {
+    pollster::block_on(run_instance_async(
+        dev, pipe, inst, leaf_bytes, inputs_dir, snap_shas,
+    ))
+}
+
+pub async fn run_instance_async(
     dev: &WgpuDevice,
     pipe: &GkrPipeline,
     inst: &GkrInstance,
@@ -519,13 +606,30 @@ pub fn run_instance(
             .write_buffer(&b, 0, &raw_bytes[start as usize..(start + per_chunk) as usize]);
         leaf_bufs.push(b);
     }
-    run_instance_gpu(dev, pipe, inst, leaf_bufs, leaf_sha, inputs_dir, snap_shas)
+    run_instance_gpu_async(dev, pipe, inst, leaf_bufs, leaf_sha, inputs_dir, snap_shas).await
 }
 
 /// W2b phase-2 entry: run rounds on PREBUILT raw-Montgomery leaf chunk
 /// buffers (produced by the WGSL leaf builder in logup_leaf.rs). Same 512 MiB
 /// chunk geometry as run_instance (nchunks = leaf_size / 2^29).
+/// Native sync API (unchanged signature): pollster wrapper over the async
+/// core (see run_instance note).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn run_instance_gpu(
+    dev: &WgpuDevice,
+    pipe: &GkrPipeline,
+    inst: &GkrInstance,
+    leaf_bufs: Vec<wgpu::Buffer>,
+    leaf_sha: String,
+    inputs_dir: &Path,
+    snap_shas: &mut Vec<LevelSnap>,
+) -> GkrOutputs {
+    pollster::block_on(run_instance_gpu_async(
+        dev, pipe, inst, leaf_bufs, leaf_sha, inputs_dir, snap_shas,
+    ))
+}
+
+pub async fn run_instance_gpu_async(
     dev: &WgpuDevice,
     pipe: &GkrPipeline,
     inst: &GkrInstance,
@@ -603,7 +707,7 @@ pub fn run_instance_gpu(
 
     // 5) root + claims0 (level 1 = 2 Fracs = tree[2], tree[3]; projective Frac add)
     let lvl1 = &levels[0];
-    let u32s = lvl1.read_words(dev, 0, lvl1.size / 4);
+    let u32s = lvl1.read_words_async(dev, 0, lvl1.size / 4).await;
     let p2 = [u32s[0], u32s[1], u32s[2], u32s[3]];
     let q2 = [u32s[4], u32s[5], u32s[6], u32s[7]];
     let p3 = [u32s[8], u32s[9], u32s[10], u32s[11]];
@@ -621,7 +725,7 @@ pub fn run_instance_gpu(
         };
         for lvl in dump_lvls {
             if (lvl as usize) <= levels.len() {
-                let words = levels[(lvl as usize) - 1].read_all(dev);
+                let words = levels[(lvl as usize) - 1].read_all_async(dev).await;
                 let canon = raw_to_canon(&words);
                 let cbytes: Vec<u8> = canon.iter().flat_map(|w| w.to_le_bytes()).collect();
                 let _ = std::fs::create_dir_all(&dir);
@@ -630,7 +734,7 @@ pub fn run_instance_gpu(
             }
         }
         for (c, lb) in leaf_bufs.iter().enumerate() {
-            let bytes = download_n(dev, lb, lb.size());
+            let bytes = download_n_async(dev, lb, lb.size()).await;
             let p = std::path::Path::new(&dir).join(format!("dbg-{}-leaf{}-gpu.bin", inst.name, c));
             let _ = std::fs::write(&p, &bytes);
         }
@@ -657,7 +761,8 @@ pub fn run_instance_gpu(
         while off < lvl_bytes {
             let n = (1u64 << 20).min(lvl_bytes - off);
             let cbytes: Vec<u8> = levels[(lvl as usize) - 1]
-                .read_words(dev, off / 4, n / 4)
+                .read_words_async(dev, off / 4, n / 4)
+                .await
                 .into_iter()
                 .flat_map(|w| decode(w).to_le_bytes())
                 .collect();
@@ -750,7 +855,7 @@ pub fn run_instance_gpu(
             dbg_lines.push(format!("lam_raw {:?}", lam));
             dbg_lines.push(format!("xis_raw {:?}", xis));
             if j + 1 < t {
-                let lw = levels[1].read_all(dev);
+                let lw = levels[1].read_all_async(dev).await;
                 dbg_lines.push(format!("lvl{}{:?}", j + 1, raw_to_canon(&lw)));
             }
         }
@@ -793,7 +898,7 @@ pub fn run_instance_gpu(
                     done += wgs * 256;
                 }
                 if dbg_on && w == 0 {
-                    let rb = download_n(dev, dst, 320);
+                    let rb = download_n_async(dev, dst, 320).await;
                     let rw: Vec<u32> = rb
                         .chunks(4)
                         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -823,7 +928,7 @@ pub fn run_instance_gpu(
                 );
                 GkrPipeline::run(dev, &pipe.pipe_seval, &bg, blocks);
                 if dbg_on && k == 0 && w == 0 {
-                    let rb = download_n(dev, &spart_a, (156 * 4).min(spart_a.size()));
+                    let rb = download_n_async(dev, &spart_a, (156 * 4).min(spart_a.size())).await;
                     let rw: Vec<u32> = rb
                         .chunks(4)
                         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -852,7 +957,7 @@ pub fn run_instance_gpu(
                     std::mem::swap(&mut sa, &mut sb);
                     nblk /= 2;
                 }
-                let sbytes = download_n(dev, sa, 48);
+                let sbytes = download_n_async(dev, sa, 48).await;
                 let su32: Vec<u32> = sbytes
                     .chunks(4)
                     .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -873,10 +978,10 @@ pub fn run_instance_gpu(
             }
 
             if std::env::var("W2A_TRACE2").is_ok() && j == 2 && k == 0 {
-                let pr = download_off(dev, &pool[slots[0] as usize], 0, 320);
+                let pr = download_off_async(dev, &pool[slots[0] as usize], 0, 320).await;
                 let pw: Vec<u32> = pr.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
                 eprintln!("TRACE2 poolrow0_1={:?}", &raw_to_canon(&pw)[..20.min(pw.len())]);
-                eprintln!("TRACE2 lvl_head={:?}", &levels[1].read_words(dev, 0, 8));
+                eprintln!("TRACE2 lvl_head={:?}", &levels[1].read_words_async(dev, 0, 8).await);
             }
             let s_evals = raw_to_canon(&s_acc);
             if dbg_on && k == 0 {
@@ -932,7 +1037,7 @@ pub fn run_instance_gpu(
                     let wmax = slots.len().min(2);
                     for (wi, ridx) in [(0usize, 0usize), (0, (1 << 21) - 1), (0, 1 << 21), (1, 0), (1, (1 << 21) - 1), (1, 1 << 21)] {
                         if wi >= wmax { continue; }
-                        let rb = download_off(dev, &pool[slots[wi] as usize], (ridx * 160) as u64, 160);
+                        let rb = download_off_async(dev, &pool[slots[wi] as usize], (ridx * 160) as u64, 160).await;
                         let rw: Vec<u32> = rb
                             .chunks(4)
                             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -947,7 +1052,7 @@ pub fn run_instance_gpu(
         let final_slot = slots[0];
         // claims = final row e/o dim evaluated at the LAST sub's r (the final
         // in-row fold the kernel loop skips when h==0): (p0,q0,p1,q1).
-        let cbytes = download_n(dev, &pool[final_slot as usize], 160);
+        let cbytes = download_n_async(dev, &pool[final_slot as usize], 160).await;
         let cu32: Vec<u32> = cbytes
             .chunks(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
