@@ -13,6 +13,9 @@ mod atlas;
 mod gatefast;
 mod grind;
 mod w2a;
+mod w2b;
+mod w2c_fold;
+mod w2d;
 
 use wgpu_backend::device::WgpuDevice;
 use crate::atlas::ReadBatch;
