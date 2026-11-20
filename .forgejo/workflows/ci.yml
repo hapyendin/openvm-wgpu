@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  cpu:
+    name: build + host proofs (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: build (native, all targets)
+        run: cargo build --release --all-targets
+      - name: u32 full-domain host proof
+        run: ./target/release/u32mul_test
+      - name: wasm32 tier compiles
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --release --target wasm32-unknown-unknown
+          cd wasm-pack && cargo check --release --target wasm32-unknown-unknown
+
+  gpu-u32:
+    name: u32+spec-floor gate on AMD iGPU (RADV, /dev/dri)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    options: --device /dev/dri
+    env:
+      OPENVM_WGPU_FARM: "1"
+      OPENVM_WGPU_FORCE_U32: "1"
+      OPENVM_WGPU_WEBGPU_LIMITS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: vulkan userspace (RADV)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq libvulkan1 mesa-vulkan-drivers vulkan-tools
+          vulkaninfo --summary | sed -n '1,25p'
+      - name: toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: build
+        run: cargo build --release --bin gate_c1 --bin u32mul_test
+      - name: gate_c1 under browser profile (u32 + spec floors)
+        run: |
+          ./target/release/gate_c1 2>&1 | tee gate.log
+          grep -q "1264a0fd266c3e7b" gate.log || { echo "GOLDEN MISMATCH: expected merkle 1264a0fd266c3e7b..."; exit 1; }
+          grep -q "a11b282970362f31" gate.log || { echo "NTT GOLDEN MISMATCH"; exit 1; }
+          echo "GATE_C1 GOLDEN GREEN ON RADV iGPU UNDER BROWSER PROFILE"
