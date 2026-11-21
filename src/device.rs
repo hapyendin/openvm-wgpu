@@ -1,11 +1,6 @@
 // Device discovery + init (API shapes mirror wgpu 30.0.2 as used by the
-// golden-proven wgpu-probe). Vulkan-only backend. GATE W1: adapter selection
-// is capability-driven (see adapters.rs) instead of "first adapter":
-// SHADER_INT64 preferred, then max_buffer_size, then discrete. require_intel_arc
-// stays as strict-mode (OPENVM_WGPU_ARC=1 / --arc); WGPU_DEVICE=<substring>
-// pins by name. No adapter passes => FAIL CLOSED with the table printed.
-// The W1 path is cfg-gated native-only (pollster enumeration); the wasm tier
-// uses init_async/init_browser with the plain request_adapter path.
+// golden-proven wgpu-probe). Vulkan-only backend. On b70 asserts Intel
+// vendor 0x8086 discrete (Arc); the farm-c1 run passes require_intel_arc=false.
 #[derive(Debug, Clone, Copy)]
 pub struct LimitsReport {
     pub max_storage_buffer_binding_size: u64,
@@ -43,12 +38,10 @@ pub struct WgpuDevice {
 }
 
 pub struct InitOpts {
-    /// require Intel (0x8086) discrete GPU — b70 strict-mode law; false = capability pick
+    /// require Intel (0x8086) discrete GPU — b70 law; false = any discrete
     pub require_intel_arc: bool,
     /// tolerate missing SHADER_INT64 (pure-u32 limb path)
-    pub allow_u32_only: bool,    /// WGPU_DEVICE=<substring>: case-insensitive substring match on adapter
-    /// name pins the adapter; no match fails closed. None = capability pick.
-    pub device_substring: Option<String>,
+    pub allow_u32_only: bool,
 }
 
 /// WebGPU spec-floor limits (pinned in code, NOT downlevel defaults —
@@ -116,52 +109,19 @@ impl WgpuDevice {
     pub async fn init_async(opts: InitOpts) -> WgpuDevice {
         #[cfg(not(target_arch = "wasm32"))]
         let t0 = std::time::Instant::now();
-        #[cfg(not(target_arch = "wasm32"))]
-        let adapter = {
-            // GATE W1 selection path: enumerate + capability-driven pick.
-            let enumerated = crate::adapters::enumerate_full();
-            let infos: Vec<crate::adapters::AdapterInfo> =
-                enumerated.iter().map(|e| e.info.clone()).collect();
-            let idx = match crate::adapters::select(
-                &infos,
-                opts.device_substring.as_deref(),
-                opts.require_intel_arc,
-                opts.allow_u32_only,
-            ) {
-                Ok(i) => i,
-                Err(reason) => {
-                    crate::adapters::print_table(&infos);
-                    panic!("FAIL CLOSED: {reason}");
-                }
-            };
-            println!(
-                "SELECTED idx={idx}/{} strategy={} score={:?}",
-                infos.len(),
-                if opts.device_substring.is_some() {
-                    "WGPU_DEVICE substring pin"
-                } else {
-                    "capability (int64, buffer_max, discrete)"
-                },
-                crate::adapters::capability_score(&infos[idx])
-            );
-            enumerated[idx].adapter.clone()
-        };
-        #[cfg(target_arch = "wasm32")]
-        let adapter = {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::VULKAN,
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            });
-            instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    force_fallback_adapter: false,
-                    compatible_surface: None,
-                    ..Default::default()
-                })
-                .await
-                .expect("no vulkan adapter")
-        };
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+                ..Default::default()
+            })
+            .await
+            .expect("no vulkan adapter");
         let info = adapter.get_info();
         let is_intel = info.vendor == 0x8086;
         // OPENVM_WGPU_FARM=1 = documented farm path (v2 portability rounds):

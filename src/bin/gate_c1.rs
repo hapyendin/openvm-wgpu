@@ -18,7 +18,6 @@ fn main() {
     let opts = InitOpts {
         require_intel_arc: !farm_mode,
         allow_u32_only: farm_mode,
-        device_substring: wgpu_backend::adapters::device_substring_from_env(),
     };
     println!("MODE: {}", if farm_mode { "farm (any discrete GPU, u32 fallback ok)" } else { "b70 (Intel Arc assert, int64 path)" });
 

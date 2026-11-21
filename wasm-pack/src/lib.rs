@@ -28,7 +28,7 @@ use wgpu_backend::limitsbuf::ShardBuf;
 use wgpu_backend::pipeline::{dispatch, dispatch_ntt, KernelCtx, NttPipelineSet, PipelineSet};
 
 /// golden perm vectors: the SAME file the native gate_c1 bin embeds.
-const VEC_SRC: &str = include_str!("../../wgpu-backend/goldens/vectors.inc");
+const VEC_SRC: &str = include_str!("../../goldens/vectors.inc");
 
 pub(crate) struct Ctx {
     dev: WgpuDevice,

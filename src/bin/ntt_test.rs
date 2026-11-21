@@ -111,7 +111,6 @@ fn main() {
     let opts = InitOpts {
         require_intel_arc: true,
         allow_u32_only: false,
-        device_substring: wgpu_backend::adapters::device_substring_from_env(),
     };
     
     let backend = WgpuBackend::new(opts);

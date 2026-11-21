@@ -1190,7 +1190,6 @@ mod seval_micro_tests {
         let dev = crate::device::WgpuDevice::init(crate::device::InitOpts {
             require_intel_arc: true,
             allow_u32_only: true,
-            device_substring: None,
         });
         let pipe = GkrPipeline::new(&dev);
         let rows = 512usize;

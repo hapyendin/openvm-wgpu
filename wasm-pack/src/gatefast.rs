@@ -16,7 +16,7 @@ use wgpu_backend::field::{
 use crate::atlas::{Atlas, Bind, ReadBatch};
 use crate::{ctx, gen_lcg, ntt_dit, twiddles, N_NTT};
 
-const VEC_SRC: &str = include_str!("../../wgpu-backend/goldens/vectors.inc");
+const VEC_SRC: &str = include_str!("../../goldens/vectors.inc");
 
 pub(crate) fn mkbuf(dev: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
     dev.create_buffer(&wgpu::BufferDescriptor {

@@ -251,12 +251,7 @@ fn main() {
     }
 
     // ---------------- GPU init ----------------
-    let arc_mode = std::env::args().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
-    if std::env::args().any(|a| a == "--list-adapters") {
-        wgpu_backend::adapters::list_adapters();
-        std::process::exit(0);
-    }
-    let dev = WgpuDevice::init(InitOpts { require_intel_arc: arc_mode, allow_u32_only: !arc_mode, device_substring: wgpu_backend::adapters::device_substring_from_env() });
+    let dev = WgpuDevice::init(InitOpts { require_intel_arc: true, allow_u32_only: false });
     eprintln!("ADAPTER {} vmhwm={}MB", dev.report.name, vm_hwm_mb());
     let pipe = GkrPipeline::new(&dev);
     let lp = LeafPipeline::new(&dev);

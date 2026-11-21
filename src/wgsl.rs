@@ -288,10 +288,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   workgroupBarrier();
   // CAS first-wins (grind pattern): exactly one thread must consume
-  // magic 0xDEADBEEFCAFE1234 built from u32 halves: a >2^63 u64 literal is
-  // rejected by naga; the halves compose exactly.
-  let magic: u64 = (u64(0xDEADBEEFu) << 32u) | u64(0xCAFE1234u);
-  let r = atomicCompareExchangeWeak(&at.v, u64(0), magic + u64(i));
+  let r = atomicCompareExchangeWeak(&at.v, u64(0), ((u64(0xDEADBEEFu) << 32u) | u64(0xCAFE1234u)) + u64(i));
   if (r.old_value == u64(0)) {
     atomicAdd(&at.c, 1u);
   }

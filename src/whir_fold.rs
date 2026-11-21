@@ -556,6 +556,7 @@ pub fn whir_stages(
 ) {
     let uni = wf.uni16(dev);
     let dummy16 = wf.empty16(dev);
+    let dummy16b = wf.empty16(dev); // WEBGPU: io2/io3 writable-alias rejected
     let ddummy = wf.dummy_ro(dev);
     let win_rows = (dev.win() / 16) as usize; // 16 B/row
     let mut half = 1usize;
@@ -584,7 +585,7 @@ pub fn whir_stages(
                     dev,
                     data.bind(dev, (e0 * 16) as u64, (w * 16) as u64),
                     dummy16.as_entire_binding(),
-                    dummy16.as_entire_binding(),
+                    dummy16b.as_entire_binding(),
                     &uni,
                     twb.as_entire_binding(),
                 );
@@ -726,4 +727,139 @@ pub fn merkle_from_rows(
     let cur = ShardBuf::new(dev, "m cur", SHARD_USAGES, (n * 32) as u64);
     merkle_init(dev, wf, rows, &cur, n);
     merkle_reduce(dev, wf, &cur, n, k_whir)
+}
+
+// ================= W2C/W2D-BROWSER async port (Phase 3d) =================
+//
+// Awaitable twins of the fold-path readbacks (same cfg split as
+// gkr::download_off_async: native = the exact sync poll(Wait) tail, wasm32 =
+// oneshot await of the mapAsync callback; device.poll is a NO-OP on the web
+// backend). Dispatch-only helpers (whir_stages / merkle_init / dispatch)
+// have no host readback and work in the browser unchanged.
+
+impl WhirFold {
+    /// Awaitable twin of `read_back`.
+    pub async fn read_back_async(dev: &WgpuDevice, b: &wgpu::Buffer, nwords: usize) -> Vec<u32> {
+        let staging = dev.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rb"),
+            size: (nwords * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = dev
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(b, 0, &staging, 0, (nwords * 4) as u64);
+        dev.queue.submit(Some(enc.finish()));
+        let slice = staging.slice(..);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            dev.device
+                .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+                .unwrap();
+            rx.recv().unwrap().unwrap();
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let (tx, rx) =
+                futures::channel::oneshot::channel::<Result<(), wgpu::BufferAsyncError>>();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                let _ = tx.send(r);
+            });
+            rx.await.unwrap().unwrap();
+        }
+        let mut out = vec![0u32; nwords];
+        let d = slice.get_mapped_range().unwrap();
+        for (i, w) in out.iter_mut().enumerate() {
+            *w = u32::from_le_bytes(d[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        drop(d);
+        staging.unmap();
+        out
+    }
+}
+
+/// Awaitable twin of `merkle_reduce` (only the final root read differs).
+pub async fn merkle_reduce_async(
+    dev: &WgpuDevice,
+    wf: &WhirFold,
+    cur: &ShardBuf,
+    n: usize,
+    k_whir: usize,
+) -> [u32; 8] {
+    let uni = wf.uni16(dev);
+    let dummy = wf.dummy_ro(dev);
+    let dummy16 = wf.empty16(dev);
+    let qs = n >> k_whir;
+    let mut size = n;
+    let mut nxt = ShardBuf::new(dev, "m nxt", SHARD_USAGES, ((n / 2) * 32) as u64);
+    let mut src = cur;
+    let mut ping = ShardBuf::new(dev, "m ping", SHARD_USAGES, ((n / 2) * 32) as u64);
+    let mut use_nxt = true;
+    let wrows_s = (dev.win() / 32).min(qs as u64).max(1) as usize;
+    for _ in 0..k_whir {
+        let nsz = size / 2;
+        let dst: &ShardBuf = if use_nxt { &nxt } else { &ping };
+        let mut i0 = 0usize;
+        while i0 < nsz {
+            let w = wrows_s.min(nsz - i0);
+            let x0 = i0 / qs;
+            WhirFold::set_uni(dev, &uni, nsz as u32, qs as u32, 0, i0 as u32);
+            let bg = wf.bind_res(
+                dev,
+                src.bind(dev, (2 * x0 * qs * 32) as u64, (w * 32) as u64),
+                src.bind(dev, ((2 * x0 + 1) * qs * 32) as u64, (w * 32) as u64),
+                dst.bind(dev, (i0 * 32) as u64, (w * 32) as u64),
+                &uni,
+                dummy.as_entire_binding(),
+            );
+            WhirFold::dispatch(dev, &wf.pair_strided, &bg, w);
+            i0 += w;
+        }
+        src = if use_nxt { &nxt } else { &ping };
+        use_nxt = !use_nxt;
+        size = nsz;
+    }
+    let wrows_a = (dev.win() / 64).max(1) as usize;
+    while size > 1 {
+        let nsz = size / 2;
+        let dst: &ShardBuf = if use_nxt { &nxt } else { &ping };
+        let mut i0 = 0usize;
+        while i0 < nsz {
+            let w = wrows_a.min(nsz - i0);
+            WhirFold::set_uni(dev, &uni, nsz as u32, 0, 0, i0 as u32);
+            let bg = wf.bind_res(
+                dev,
+                src.bind(dev, (i0 * 64) as u64, (w * 64) as u64),
+                dst.bind(dev, (i0 * 32) as u64, (w * 32) as u64),
+                dummy16.as_entire_binding(),
+                &uni,
+                dummy.as_entire_binding(),
+            );
+            WhirFold::dispatch(dev, &wf.pair_adj, &bg, w);
+            i0 += w;
+        }
+        src = if use_nxt { &nxt } else { &ping };
+        use_nxt = !use_nxt;
+        size = nsz;
+    }
+    let root_m = src.read_words_async(dev, 0, 8).await;
+    std::array::from_fn(|i| decode(root_m[i]))
+}
+
+/// Awaitable twin of `merkle_from_rows`.
+pub async fn merkle_from_rows_async(
+    dev: &WgpuDevice,
+    wf: &WhirFold,
+    rows: &ShardBuf,
+    n: usize,
+    k_whir: usize,
+) -> [u32; 8] {
+    let cur = ShardBuf::new(dev, "m cur", SHARD_USAGES, (n * 32) as u64);
+    merkle_init(dev, wf, rows, &cur, n);
+    merkle_reduce_async(dev, wf, &cur, n, k_whir).await
 }

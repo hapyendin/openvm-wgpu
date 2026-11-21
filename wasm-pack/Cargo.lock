@@ -1108,6 +1108,7 @@ dependencies = [
 name = "wgpu-backend"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "pollster",
  "serde",
  "serde_json",

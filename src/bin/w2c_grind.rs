@@ -102,12 +102,7 @@ fn main() {
         assert_eq!(t["bits"].as_u64().unwrap() as u32, s.bits, "bits");
     }
 
-    let arc_mode = std::env::args().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
-    if std::env::args().any(|a| a == "--list-adapters") {
-        wgpu_backend::adapters::list_adapters();
-        std::process::exit(0);
-    }
-    let dev = WgpuDevice::init(InitOpts { require_intel_arc: arc_mode, allow_u32_only: !arc_mode, device_substring: wgpu_backend::adapters::device_substring_from_env() });
+    let dev = WgpuDevice::init(InitOpts { require_intel_arc: true, allow_u32_only: false });
     println!("ADAPTER {}", dev.report.name);
     let wf = WhirFold::new(&dev);
     let src = format!("{}{}\n{}", wgsl::mul_prelude(dev.has_shader_int64), wgsl::COMMON, GRIND_WGSL);

@@ -27,12 +27,10 @@ fn try_run(label: &str, f: impl FnOnce() -> bool) -> bool {
 }
 
 fn main() {
-    let arc_mode = std::env::args().any(|a| a == "--arc") || std::env::var("OPENVM_WGPU_ARC").is_ok();
-    if std::env::args().any(|a| a == "--list-adapters") {
-        wgpu_backend::adapters::list_adapters();
-        std::process::exit(0);
-    }
-    let dev = WgpuDevice::init(InitOpts { require_intel_arc: arc_mode, allow_u32_only: !arc_mode, device_substring: wgpu_backend::adapters::device_substring_from_env() });
+    let dev = WgpuDevice::init(InitOpts {
+        require_intel_arc: true,
+        allow_u32_only: true,
+    });
     let caps = dev.device.limits();
     println!(
         "device binding_cap={} buf_cap={}",

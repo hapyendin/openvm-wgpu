@@ -253,7 +253,6 @@ fn main() {
     let opts = InitOpts {
         require_intel_arc: !farm_mode,
         allow_u32_only: farm_mode,
-        device_substring: wgpu_backend::adapters::device_substring_from_env(),
     };
     let gb = WgpuBackend::new(opts);
     println!("Adapter: {} (INT64={})\n", gb.dev.report.name, gb.dev.has_shader_int64);

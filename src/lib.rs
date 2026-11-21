@@ -1,4 +1,3 @@
-pub mod adapters;
 pub mod device;
 pub mod field;
 pub mod gkr;
@@ -6,6 +5,7 @@ pub mod gkr_wgsl;
 pub mod limitsbuf;
 pub mod logup_leaf;
 pub mod mat;
+pub mod readfix;
 pub mod pipeline;
 pub mod traits;
 pub mod wgsl;
