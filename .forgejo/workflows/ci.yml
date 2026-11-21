@@ -11,7 +11,7 @@ env:
 jobs:
   cpu:
     name: build + host proofs (CPU)
-    runs-on: ubuntu-latest
+    runs-on: [ci, linux]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -31,9 +31,8 @@ jobs:
 
   gpu-u32:
     name: u32+spec-floor gate on AMD iGPU (RADV, /dev/dri)
-    runs-on: ubuntu-latest
+    runs-on: [ci, linux]
     timeout-minutes: 90
-    options: --device /dev/dri
     env:
       OPENVM_WGPU_FARM: "1"
       OPENVM_WGPU_FORCE_U32: "1"
