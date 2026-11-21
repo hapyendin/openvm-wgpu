@@ -65,7 +65,7 @@ fn fft_fixed(a: &mut [u32]) {
     }
 }
 fn main() {
-    let d = "/home/matt/appz/openvm-sycl-skel/b9/r15/w2c-r1/whir";
+    let d = "data/b9/r15/w2c-r1/whir";
     let tag = std::env::args().nth(1).unwrap_or("0".into());
     let round = std::env::args().nth(2).unwrap_or("0".into());
     let k_whir: usize;
@@ -192,7 +192,7 @@ fn main() {
     println!("sampled={sampled} identity={ident} bitrev={bitrev} revord={revord}");
     // OOD direct test: z0 at stream ev, y at ev+4 (app r0: ev=13793)
     if tag == "0" {
-        let sd = "/home/matt/appz/openvm-sycl-skel/b9/w2c/streams-r1";
+        let sd = "data/b9/w2c/streams-r1";
         let sv = read_u32s_raw_u64(&format!("{sd}/app-segments_0.prove.bin"));
         let evz = 13793usize;
         let z0 = [encode(sv[evz]), encode(sv[evz+1]), encode(sv[evz+2]), encode(sv[evz+3])];

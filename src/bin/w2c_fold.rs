@@ -118,7 +118,7 @@ struct InstPlan {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut whir = PathBuf::from("/home/matt/appz/openvm-sycl-skel/b9/r15/w2c-r1/whir");
+    let mut whir = PathBuf::from("data/b9/r15/w2c-r1/whir");
     let mut gold = PathBuf::from("w2c-results-r1-GREEN.json");
     let mut out = PathBuf::from("w2c-fold-report.json");
     let mut runs = 5usize;

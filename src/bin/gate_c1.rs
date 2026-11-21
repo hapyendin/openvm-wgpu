@@ -14,12 +14,12 @@ const VEC_SRC: &str = include_str!("../../goldens/vectors.inc");
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    let farm_mode = argv.iter().any(|a| a == "--farm") || std::env::var("OPENVM_WGPU_FARM").is_ok();
+    let portable_mode = argv.iter().any(|a| a == "--any-gpu") || std::env::var("OPENVM_WGPU_ANY").is_ok();
     let opts = InitOpts {
-        require_intel_arc: !farm_mode,
-        allow_u32_only: farm_mode,
+        require_intel_arc: !portable_mode,
+        allow_u32_only: portable_mode,
     };
-    println!("MODE: {}", if farm_mode { "farm (any discrete GPU, u32 fallback ok)" } else { "b70 (Intel Arc assert, int64 path)" });
+    println!("MODE: {}", if portable_mode { "any-GPU (u32 fallback ok)" } else { "strict (Intel Arc assert, int64 path)" });
 
     // ---- 0) CPU reference self-check against goldens (must pass first) ----
     let vectors = parse_vectors(VEC_SRC);

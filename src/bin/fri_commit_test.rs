@@ -249,10 +249,10 @@ fn main() {
         })
         .collect();
 
-    let farm_mode = std::env::var("OPENVM_WGPU_FARM").is_ok();
+    let portable_mode = std::env::var("OPENVM_WGPU_ANY").is_ok();
     let opts = InitOpts {
-        require_intel_arc: !farm_mode,
-        allow_u32_only: farm_mode,
+        require_intel_arc: !portable_mode,
+        allow_u32_only: portable_mode,
     };
     let gb = WgpuBackend::new(opts);
     println!("Adapter: {} (INT64={})\n", gb.dev.report.name, gb.dev.has_shader_int64);

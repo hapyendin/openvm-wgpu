@@ -116,7 +116,7 @@ cd ~/appz/openvm-wgpu && ./target/release/fri_commit_test 2>&1
 ## Files Modified/Created
 - `wgpu-backend/src/bin/fri_commit_test.rs` — Full C3+C4 test (312 lines)
 - `wgpu-backend/src/wgsl.rs` — Restored original (407 lines, encw→mix→decode)
-- `b3/conformance-v1.json` — Reference (read-only access via b70)
+- `b3/conformance-v1.json` — Reference (read-only access via the Arc reference box)
 
 ## Appendix A: Per-Layer Results (All 6 Layers)
 

@@ -50,8 +50,8 @@ struct Site {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut bases = PathBuf::from("w2c-grind-bases.bin");
-    let mut sites_f = PathBuf::from("/home/matt/appz/openvm-wgpu/w2c/pow_sites_r1.jsonl");
-    let mut gold = PathBuf::from("/home/matt/appz/openvm-wgpu/w2c-results-r1-GREEN.json");
+    let mut sites_f = PathBuf::from("w2c/pow_sites_r1.jsonl");
+    let mut gold = PathBuf::from("w2c-results-r1-GREEN.json");
     let mut out = PathBuf::from("w2c-grind-report.json");
     let mut runs = 5usize;
     let mut i = 0;

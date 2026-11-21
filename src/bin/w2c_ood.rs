@@ -52,9 +52,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let inst = args.get(1).map(|s| s.as_str()).unwrap_or("0");
     let evz: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(13793);
-    let stream_file = format!("/home/matt/appz/openvm-sycl-skel/b9/w2c/streams-r1/{}.prove.bin", ["app-segments_0","agg-leaf_0","agg-internal-for-leaf_0","agg-internal-recursive_0","wrap-internal-recursive.1_0"][inst.parse::<usize>().unwrap()]);
+    let stream_file = format!("data/b9/w2c/streams-r1/{}.prove.bin", ["app-segments_0","agg-leaf_0","agg-internal-for-leaf_0","agg-internal-recursive_0","wrap-internal-recursive.1_0"][inst.parse::<usize>().unwrap()]);
     let sv = stream_words(&stream_file);
-    let mut gc = read_ef(&format!("/home/matt/appz/openvm-sycl-skel/b9/r15/w2c-r1/whir/w{inst}-r0-gcoeffs.bin"));
+    let mut gc = read_ef(&format!("data/b9/r15/w2c-r1/whir/w{inst}-r0-gcoeffs.bin"));
     if gc.len() > (1 << 20) { gc.truncate(1 << 20); }
     println!("gc rows {} evz {evz}", gc.len());
     for d in [-16i64, -12, -8, -4, 0, 4, 8, 12] {

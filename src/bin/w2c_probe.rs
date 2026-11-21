@@ -86,7 +86,7 @@ fn run(p2: &Poseidon2, vals: &[u32], flags: &[bool], edit: &Edit) -> Vec<(usize,
 }
 
 fn main() {
-    let dir = "/home/matt/appz/openvm-sycl-skel/b9/w2c/streams-r1";
+    let dir = "data/b9/w2c/streams-r1";
     let (av, af) = load(dir, "app-segments_0");
     let (gv, gf) = load(dir, "agg-leaf_0");
     let p2 = Poseidon2::new();

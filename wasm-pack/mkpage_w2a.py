@@ -11,8 +11,8 @@ html = """<!doctype html><html><head><meta charset=utf-8></head><body>
 <pre id=out style="font-size:10px"></pre>
 <script>
 const B64='WASMB64';
-const JSON_URL='file:///home/matt/appz/openvm-wgpu/wgpu-backend/gkr-inputs.json';
-const LEAF_URL='file:///home/matt/appz/openvm-sycl-skel/b9/r15/x-l1a-r1/dbg_agg-leaf_0_leaves_cpu.bin';
+const JSON_URL='file:///DATA/gkr-inputs.json';
+const LEAF_URL='file:///DATA/sycl-skel/b9/r15/x-l1a-r1/dbg_agg-leaf_0_leaves_cpu.bin';
 const INST='agg-leaf_0';
 const GOLD_LEAF='5c65a7bbc355594da3b4bd1866d6e128a013b5d65c1d15405e149ef0c6edb6ac';
 const GOLD_CLAIM='fd53a33e82d7319b551a97c0710e5e75fac26980c0b6c1b02bd79bef0929f691';

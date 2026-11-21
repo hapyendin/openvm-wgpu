@@ -14,8 +14,8 @@ html = """<!doctype html><html><head><meta charset=utf-8></head><body>
 <pre id=out style="font-size:10px"></pre>
 <script>
 const B64='WASMB64';
-const WHIR='file:///home/matt/appz/openvm-sycl-skel/b9/r15/w2c-r1/whir/';
-const GREENURL='file:///home/matt/appz/openvm-wgpu/w2c-results-r1-GREEN.json';
+const WHIR='file:///DATA/sycl-skel/b9/r15/w2c-r1/whir/';
+const GREENURL='file:///DATA/w2c-results-r1-GREEN.json';
 const NAMES=['app-segments_0','agg-leaf_0','agg-internal-for-leaf_0','agg-internal-recursive_0','wrap-internal-recursive.1_0'];
 const GOLD={ '1-0':'5b91a9e38bfa47fb633ce4ee564a0175f6f360c1e7d8b0e3f7e607e98547777c',
             '1-1':'28948222729453e28e950f1dd4c6c2435c1d77521cd4dd88266ea521b744c1e8' };

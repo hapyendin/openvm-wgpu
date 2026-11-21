@@ -98,11 +98,11 @@ fn grind_check(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut world = PathBuf::from("/home/matt/appz/openvm-sycl-skel/b9/r15/w2d-r1");
-    let mut inputs = PathBuf::from("/home/matt/appz/openvm-wgpu/w2d/w2d-inputs");
-    let mut streams = PathBuf::from("/home/matt/appz/openvm-wgpu/w2d/streams-w2d");
-    let mut out = PathBuf::from("/home/matt/appz/openvm-wgpu/w2d/app-segments_0.prove.bin.w2d");
-    let mut report = PathBuf::from("/home/matt/appz/openvm-wgpu/w2d/w2d-report.json");
+    let mut world = PathBuf::from("data/b9/r15/w2d-r1");
+    let mut inputs = PathBuf::from("w2d/w2d-inputs");
+    let mut streams = PathBuf::from("w2d/streams-w2d");
+    let mut out = PathBuf::from("w2d/app-segments_0.prove.bin.w2d");
+    let mut report = PathBuf::from("w2d/w2d-report.json");
     let mut stop_at = String::from("all");
     let mut i = 0;
     while i < args.len() {

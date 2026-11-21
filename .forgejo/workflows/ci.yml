@@ -34,7 +34,7 @@ jobs:
     runs-on: [ci, linux]
     timeout-minutes: 90
     env:
-      OPENVM_WGPU_FARM: "1"
+      OPENVM_WGPU_ANY: "1"
       OPENVM_WGPU_FORCE_U32: "1"
       OPENVM_WGPU_WEBGPU_LIMITS: "1"
     steps:

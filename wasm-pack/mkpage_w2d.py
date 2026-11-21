@@ -11,9 +11,9 @@ html = """<!doctype html><html><head><meta charset=utf-8></head><body>
 <pre id=out style="font-size:10px"></pre>
 <script>
 const B64='WASMB64';
-const W='file:///home/matt/appz/openvm-sycl-skel/b9/r15/w2d-r1/';
-const I='file:///home/matt/appz/openvm-wgpu/w2d/w2d-inputs/';
-const S='file:///home/matt/appz/openvm-wgpu/w2d/streams-w2d/';
+const W='file:///DATA/sycl-skel/b9/r15/w2d-r1/';
+const I='file:///DATA/w2d/w2d-inputs/';
+const S='file:///DATA/w2d/streams-w2d/';
 const TR=W+'traces/app-segments_0/';
 const GOLD='3e3bfbec62b817f5f9813a326af4698816bd9f95fd4a7d83a9ea9e6f4b7a3d0d';
 const outEl=document.getElementById('out');

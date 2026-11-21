@@ -8,7 +8,7 @@
 ```
 $ ./target/release/gate_c1
 
-MODE: b70 (Intel Arc assert, int64 path)
+MODE: strict (Intel Arc assert, int64 path)
 CPU_REFERENCE_GOLDEN: PASS
 ADAPTER_IS_INTEL_ARC: true
 FEATURES_AVAILABLE: SHADER_INT64,TEXTURE_INT64_ATOMIC,TIMESTAMP_QUERY
@@ -28,7 +28,7 @@ GATE_C1: PASS
 ## C2 Gate (ntt_test)
 
 **Date**: 2026-11-15  
-**Target**: b70 (same as above)
+**Target**: Intel Arc BMG G31 (same as above)
 
 ```
 $ ./target/debug/ntt_test
@@ -63,7 +63,7 @@ NTT_TEST: PASS
 ## Build Command
 
 ```bash
-# On b70
+# On the Arc box
 cd ~/appz/openvm-wgpu
 export PATH=~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH
 cargo build --release
@@ -175,7 +175,7 @@ zero-pad → p3-dft per column).
 ### Build Command
 
 ```bash
-# On b70
+# On the Arc box
 cd ~/appz/openvm-wgpu
 export PATH=~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH
 cargo build --release

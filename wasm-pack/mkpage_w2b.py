@@ -13,8 +13,8 @@ html = """<!doctype html><html><head><meta charset=utf-8></head><body>
 <pre id=out style="font-size:10px"></pre>
 <script>
 const B64='WASMB64';
-const INPUTS='file:///home/matt/appz/openvm-w2b/work/w2b-inputs/';
-const TRACES='file:///home/matt/appz/openvm-sycl-skel/b9/dump-cpu9/traces/app-segments_0/';
+const INPUTS='file:///DATA/w2b/work/w2b-inputs/';
+const TRACES='file:///DATA/sycl-skel/b9/dump-cpu9/traces/app-segments_0/';
 const GOLD_LEAF='f5ecc63de1646b064ff943f9bd59cbea0b2ec799a73dc5c33cafe3342d4a965f';
 const GOLD_OUT='8c06f8ac2b4070d68b46f2a7d2112855d354c91584b3edeeb374e84a8e370a63';
 const outEl=document.getElementById('out');

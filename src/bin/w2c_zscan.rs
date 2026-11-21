@@ -33,15 +33,15 @@ fn main() {
         "wrap-internal-recursive.1_0",
     ];
     let sv = stream_words(&format!(
-        "/home/matt/appz/openvm-sycl-skel/b9/w2c/streams-r1/{}.prove.bin",
+        "data/b9/w2c/streams-r1/{}.prove.bin",
         names[inst]
     ));
     let mut gc = read_ef(&format!(
-        "/home/matt/appz/openvm-sycl-skel/b9/r15/w2c-r1/whir/w{inst}-r0-gcoeffs.bin"
+        "data/b9/r15/w2c-r1/whir/w{inst}-r0-gcoeffs.bin"
     ));
     // true coeffs = first 2^(m-k): derive from meta m,k
     let meta = std::fs::read_to_string(format!(
-        "/home/matt/appz/openvm-sycl-skel/b9/r15/w2c-r1/whir/w{inst}-meta.txt"
+        "data/b9/r15/w2c-r1/whir/w{inst}-meta.txt"
     ))
     .unwrap();
     let mp = |k: &str| -> usize {

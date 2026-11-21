@@ -1,8 +1,8 @@
-# GATE W1 — Adapter discovery + capability-driven selection (port-lab run, 2026-11-16)
+# GATE W1 — Adapter discovery + capability-driven selection (NVIDIA A16 run, 2026-11-16)
 
-Host: Vultr port-lab (45.77.145.125), Ubuntu, NVIDIA A16 (GRID vGPU, driver 620.70.06),
+Host: cloud VM, Ubuntu, NVIDIA A16 (GRID vGPU, driver 620.70.06),
 rustc 1.91.1, wgpu =30.0.2 (pinned, `--locked`), `WGPU_BACKEND=vulkan`.
-Tree: /root/wgpu-w1 (public tree + W1 changes), commit `287743f` (git init inside port-lab).
+Tree: public tree + W1 changes, commit `287743f`.
 
 **Verdict: PASS.** Goldens byte-exact on the A16 through the NEW selector; no WGSL/kernel
 changes; `--list-adapters` on all three bins; fail-closed verified.
@@ -64,12 +64,12 @@ over llvmpipe correctly.
 | fri_commit_test | all 6 layer roots `[PASS]` · `GOLDEN_99FC8DF2_CPU: PASS` · `GOLDEN_99FC8DF2_GPU: PASS` · `GPU==CPU parity: 0/3008 words bad` |
 
 Cross-vendor re-proof: merkle `1264a0fd…`, NTT `a11b2829…`, FRI `99fc8df2…` — byte-exact
-on NVIDIA via the W1 selector (farm-c1 proved them via the old first-adapter path; zero
+on NVIDIA via the W1 selector (an earlier NVIDIA box proved them via the old first-adapter path; zero
 WGSL diff between them).
 
 ## 4. FINDING (pre-existing, NOT a W1 regression): atomic-probe WGSL fails naga@30
 
-`gate_c1` crashed **on the PRISTINE public tree too** (`/root/wgpu-baseline`,
+`gate_c1` crashed **on the PRISTINE public tree too** (
 `gate_c1_pristine.out`, built `--locked` from the staged tree):
 
 ```
@@ -97,7 +97,7 @@ exactly why capability-driven auto-selection (never picks llvmpipe: score
 
 ## 6. Parent-note follow-up: GRID vGPU Vulkan
 
-Parent suspected port-lab A16 exposes no Vulkan compute. **Refuted by evidence:** wgpu
+Suspected the A16 exposes no Vulkan compute. **Refuted by evidence:** wgpu
 enumerates `NVIDIA A16` vendor 0x10de device 0x25b6 DiscreteGpu, driver 620.70.06,
 Vulkan instance 1.4.309 (vulkaninfo), and all three gates PASS byte-exact on it. Only
 the probe WGSL (§4) failed, identically on the pristine baseline.
@@ -109,7 +109,6 @@ the probe WGSL (§4) failed, identically on the pristine baseline.
 - `src/lib.rs` (`pub mod adapters;`)
 - `src/bin/{gate_c1,ntt_test,fri_commit_test}.rs` (--list-adapters, WGPU_DEVICE wiring, probe Err arm)
 - `README.md` (Running-it + Status updates)
-- port-lab artifacts: /root/wgpu-w1/{W1-REPORT.md, fri_auto.out→/tmp/*.out, build.log}, /root/wgpu-baseline/gate_c1_pristine.out
 
 ## Parent addendum (post-review)
 
@@ -118,7 +117,7 @@ The naga probe rejection (finding #1) was fixed on the same day, two WGSL edits:
    (literals > 2^63 are not universal-WGSL; naga@30 rejects them).
 2. `r.consumed` -> `r.exchanged` (spec member name; `consumed` was a dead Tint-era alias).
 
-Verified on port-lab A16 through the new selector, 3/3 runs:
+Verified on A16 through the new selector, 3/3 runs:
 `U64_ATOMICS: WORKING (cas_winners=1 sum=0xdeadbeefcafe1314 expect base+winner+224)`
 + GATE_C1 PASS, ntt_test PASS, fri_commit_test root0 PASS. The Arc B70 row + probe
 re-verification is the parent's next step once the b70 engine yields (engine-on-card rule).

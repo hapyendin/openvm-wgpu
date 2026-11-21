@@ -1,6 +1,6 @@
 # C3-APPLY report — fri_commit_test v6 on b70 (Arc Pro B70 / BMG G31)
 
-Base report authored on the NVIDIA farm box (validated there first); this file records
+Base report authored on an NVIDIA test box (validated there first); this file records
 the Arc stamp of the same patch on b70 under kernel 7.2.6+deb13-amd64.
 
 ## ARC-STAMP — 2026-11-15 23:15–23:23 PST (b70, Mesa 26.1.6-1~bpo13+1, wgpu 30.0.2, Vulkan path)
@@ -25,7 +25,7 @@ the Arc stamp of the same patch on b70 under kernel 7.2.6+deb13-amd64.
 ## Notes / deltas vs task brief
 
 1. Brief said tree pins wgpu **26.0.1**; actual `wgpu-backend/Cargo.toml` pins **=30.0.2**
-   (= same minor v6 was authored against on the farm) → zero port deltas. Nothing to adapt.
+   (= same minor v6 was authored against on the NVIDIA box) → zero port deltas. Nothing to adapt.
 2. System `/usr/bin/cargo` (1.85.1) is too old for wgpu 30 (needs rustc >= 1.87); the tree
    builds with the host rustup toolchain (`~/.cargo/bin`, rustc 1.100.0). Workspace root is
    `~/appz/openvm-wgpu` (binaries land in `../target/release` relative to wgpu-backend).

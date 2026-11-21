@@ -1,6 +1,6 @@
 // Device discovery + init (API shapes mirror wgpu 30.0.2 as used by the
 // golden-proven wgpu-probe). Vulkan-only backend. On b70 asserts Intel
-// vendor 0x8086 discrete (Arc); the farm-c1 run passes require_intel_arc=false.
+// vendor 0x8086 discrete (Arc); the portability runs pass require_intel_arc=false.
 #[derive(Debug, Clone, Copy)]
 pub struct LimitsReport {
     pub max_storage_buffer_binding_size: u64,
@@ -124,11 +124,11 @@ impl WgpuDevice {
             .expect("no vulkan adapter");
         let info = adapter.get_info();
         let is_intel = info.vendor == 0x8086;
-        // OPENVM_WGPU_FARM=1 = documented farm path (v2 portability rounds):
+        // OPENVM_WGPU_ANY=1 = any-vendor portability path:
         // accepts the first Vulkan adapter of any vendor; Arc goldens unaffected.
-        let farm = std::env::var("OPENVM_WGPU_FARM").is_ok();
+        let portable = std::env::var("OPENVM_WGPU_ANY").is_ok();
         assert!(
-            !opts.require_intel_arc || is_intel || farm,
+            !opts.require_intel_arc || is_intel || portable,
             "ADAPTER ASSERT FAIL: expected Intel Arc (vendor 0x8086), got vendor 0x{:x} ({})",
             info.vendor,
             info.name

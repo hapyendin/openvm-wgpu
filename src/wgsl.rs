@@ -1,5 +1,5 @@
 // WGSL sources. The BabyBear mul paths + Poseidon2 perm body are copied
-// VERBATIM from b70:~/appz/wgpu-probe/src/main.rs (golden-proven 11-15,
+// VERBATIM from the golden-proven 11-15 wgpu probe (
 // 12,287-perm batch byte-exact + NTT golden). Only the merkle build-path
 // entries (derive/sponge_init/compress) are new here, mirroring
 // openvm-sycl-skel/b1/ported/merkle_kernels.hpp 1:1.
