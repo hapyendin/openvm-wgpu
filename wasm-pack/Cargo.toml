@@ -13,7 +13,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wgpu-backend = { path = "../wgpu-backend" }
+wgpu-backend = { path = ".." }
 wgpu = "=30.0.2"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

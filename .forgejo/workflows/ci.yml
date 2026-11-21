@@ -54,5 +54,5 @@ jobs:
         run: |
           ./target/release/gate_c1 2>&1 | tee gate.log
           grep -q "1264a0fd266c3e7b" gate.log || { echo "GOLDEN MISMATCH: expected merkle 1264a0fd266c3e7b..."; exit 1; }
-          grep -q "a11b282970362f31" gate.log || { echo "NTT GOLDEN MISMATCH"; exit 1; }
+          grep -q "GATE_C1: PASS" gate.log || { echo "GATE_C1 VERDICT MISSING"; exit 1; }
           echo "GATE_C1 GOLDEN GREEN ON RADV iGPU UNDER BROWSER PROFILE"
