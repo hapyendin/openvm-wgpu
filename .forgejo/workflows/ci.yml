@@ -28,6 +28,11 @@ jobs:
           rustup target add wasm32-unknown-unknown
           cargo check --release -p wgpu-backend --lib --target wasm32-unknown-unknown
           cd wasm-pack && cargo check --release --target wasm32-unknown-unknown
+      - name: runner diagnostics (on failure)
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .forgejo/diag.sh
 
   gpu-u32:
     name: u32+spec-floor gate on AMD iGPU (RADV, /dev/dri)
@@ -56,3 +61,8 @@ jobs:
           grep -q "1264a0fd266c3e7b" gate.log || { echo "GOLDEN MISMATCH: expected merkle 1264a0fd266c3e7b..."; exit 1; }
           grep -q "GATE_C1: PASS" gate.log || { echo "GATE_C1 VERDICT MISSING"; exit 1; }
           echo "GATE_C1 GOLDEN GREEN ON RADV iGPU UNDER BROWSER PROFILE"
+      - name: runner diagnostics (on failure)
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .forgejo/diag.sh

@@ -1,4 +1,5 @@
 # openvm-wgpu — a WGSL proving-backend substrate for OpenVM STARKs
+> **Live demo: [prove in your browser](https://hapyendin.github.io/openvm-wgpu/)** - the u32/WGSL gates run live on YOUR GPU in a tab, byte-exact goldens, zero server-side compute.
 
 > **Note:** this GitHub repository is a one-way mirror; the canonical history is maintained upstream. Issues and PRs are welcome here.
 
