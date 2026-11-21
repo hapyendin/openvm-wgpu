@@ -20,7 +20,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: build (native, all targets)
-        run: cargo build --release --all-targets
+        run: cargo build --release -p wgpu-backend --all-targets
       - name: u32 full-domain host proof
         run: ./target/release/u32mul_test
       - name: wasm32 tier compiles
