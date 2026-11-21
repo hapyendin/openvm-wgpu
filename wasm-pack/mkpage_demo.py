@@ -45,10 +45,10 @@ function log(s){ console.log(s); out.textContent += s + "\n"; out.scrollTop = ou
 function card(id, txt, ok){ const el=document.getElementById(id); el.textContent=txt; el.className='v '+(ok===null?'wait':(ok?'pass':'fail')); }
 function b64ToBytes(b){ const bin=atob(b); const u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i); return u; }
 async function run(){
-  if (!navigator.gpu){ log('WebGPU not available in this browser (try Chrome/Edge with WebGPU enabled).'); return; }
+  if (!navigator.gpu){ log('WebGPU not available in this browser. Chrome/Edge 113+, or Safari 26+, or Firefox 141+ with a working Vulkan driver.'); card('dev','no WebGPU here', false); return; }
   let adapter=null;
   for (let i=0;i<20&&!adapter;i++){ adapter=await navigator.gpu.requestAdapter({powerPreference:'high-performance'}); if(!adapter) await new Promise(r=>setTimeout(r,500)); }
-  if (!adapter){ log('requestAdapter returned null (WebGPU blocked or no adapter).'); return; }
+  if (!adapter){ log('requestAdapter returned null (WebGPU blocked by flag/policy, GPU driver too old, or headless without --enable-unsafe-webgpu).'); card('dev','adapter null', false); return; }
   const ai = adapter.info && Object.keys(adapter.info).length ? adapter.info : (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {});
   log('ADAPTER ' + JSON.stringify(ai));
   const feats=[]; adapter.features.forEach(f=>feats.push(f));
